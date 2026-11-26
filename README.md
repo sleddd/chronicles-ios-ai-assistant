@@ -1,6 +1,10 @@
 # Smith
-Smith is a voice-first personal assistant for Mac and iPad. It knows your day from Chronicles: tasks, priorities, events, habits, doses and bill dates. You can talk to it or type, and it answers in text and out loud, warmly, like a friend who knows your schedule. It can also act in Chronicles for you: log a meal, tick a dose, check off a habit, save a note, add or finish a task, help reorganize your daily agenda, or mark a bill paid.
+Smith is a voice-first personal assistant for Mac and iPad. It knows your day from Chronicles including your tasks, goals, roadmap, vision, priorities, events, habits, doses, and calendar. You can talk to it or type, and it answers in text and out loud, warmly, like a friend who knows your schedule. It can also act in Chronicles for you to log a meal, tick a dose, check off a habit, save a note, add or finish a task, help reorganize your daily agenda, or mark a bill paid.
 
+<img width="900" height="712" alt="smith-without-stats" src="https://github.com/user-attachments/assets/19d59aa9-f76a-46fc-931c-59d15dc304e8" />
+<img width="900" height="712" alt="smith-with-stats" src="https://github.com/user-attachments/assets/d8af3396-ed82-48ef-8381-0609ebaddbea" />
+
+##
 > [!WARNING]
 > **Smith is under active development and is not ready for beta.** Expect missing pieces, breaking changes and data you may have to re-import. Don't rely on it for anything important yet.
 >
