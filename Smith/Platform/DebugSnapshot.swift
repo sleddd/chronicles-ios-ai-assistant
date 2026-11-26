@@ -141,6 +141,8 @@ enum DebugSnapshot {
                 AppModel.shared.showChat = true
             }
             if args.contains("--chat-demo") {
+                AppModel.shared.chronicles.debugShowAsUnlocked()
+                AppModel.shared.safety.debugSkipConsent()
                 AppModel.shared.brain.debugFill()
                 AppModel.shared.showChat = true
             }

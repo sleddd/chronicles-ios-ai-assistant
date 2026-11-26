@@ -362,6 +362,8 @@ struct HomeView: View {
 struct ChatView: View {
     @Environment(AppModel.self) private var app
     @State private var editing: Fact?
+    /// The reply being heard again.
+    @State private var replayingID: UUID?
 
     var body: some View {
         let brain = app.brain
@@ -419,14 +421,26 @@ struct ChatView: View {
             }
         case .smith:
             // A light, faded bubble with its point on the left; emotes in soft italics
-            HStack {
-                emoteText(line.text, emote: Theme.dim)
-                    .font(Theme.rounded(16)).foregroundStyle(Theme.soft).lineSpacing(7).textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.leading, 16 + ChatBubble.tail).padding(.trailing, 16).padding(.vertical, 13)
-                    .background(ChatBubble(tailOnRight: false).fill(Color.white.opacity(0.07)))
-                    .overlay(ChatBubble(tailOnRight: false).stroke(.white.opacity(0.05)))
-                Spacer(minLength: 40)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    emoteText(line.text, emote: Theme.dim)
+                        .font(Theme.rounded(16)).foregroundStyle(Theme.soft).lineSpacing(7).textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.leading, 16 + ChatBubble.tail).padding(.trailing, 16).padding(.vertical, 13)
+                        .background(ChatBubble(tailOnRight: false).fill(Color.white.opacity(0.07)))
+                        .overlay(ChatBubble(tailOnRight: false).stroke(.white.opacity(0.05)))
+                    Spacer(minLength: 40)
+                }
+                // Hear it again (loading while the voice is made, Stop while it plays)
+                let mine = replayingID == line.id
+                HearButton(busy: mine && app.voice.state == .speaking, loading: mine && app.voice.preparing, compact: true) {
+                    replayingID = line.id
+                    app.voice.preview(app.smithSpeaker, text: line.text)
+                } stop: { app.voice.stopSpeaking() }
+                .font(.system(size: 13))
+                .foregroundStyle(mine && app.voice.state == .speaking ? Theme.teal : Theme.faint)
+                .padding(.leading, 14 + ChatBubble.tail)
+                .help("Hear it again")
             }
         case .note:
             Caps(line.text, size: 9, color: Theme.faint)
