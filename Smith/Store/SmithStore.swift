@@ -12,7 +12,7 @@ import SmithCore
 final class SmithStore {
     private(set) var snapshot: ChroniclesSnapshot?
     private(set) var journal: [JournalRecord] = []
-    var aboutYou = AboutYouStore() { didSet { save(aboutYou, "about-you.smith") } }
+    var aboutYou = AboutYouStore() { didSet { save(aboutYou, "about-you.smith"); smithDataChanged() } }
     private(set) var conversations: [ConversationSummary] = []
     private(set) var conversationTombstones: [Tombstone] = []
     private(set) var letters: [Letter] = []
@@ -103,6 +103,7 @@ final class SmithStore {
 
     private func saveConversations() {
         save(Records(items: conversations, tombstones: conversationTombstones), "conversations.smith")
+        smithDataChanged()
     }
 
     // MARK: letters
@@ -126,7 +127,37 @@ final class SmithStore {
         saveLetters()
     }
 
-    private func saveLetters() { save(Records(items: letters, tombstones: letterTombstones), "letters.smith") }
+    private func saveLetters() {
+        save(Records(items: letters, tombstones: letterTombstones), "letters.smith")
+        smithDataChanged()
+    }
+
+    // MARK: Smith's records in Chronicles
+
+    /// Called when memories, letters or summaries change here (to send them to Chronicles).
+    var onSmithDataChanged: (() -> Void)?
+    private var applyingFromChronicles = false
+    private func smithDataChanged() { if !applyingFromChronicles { onSmithDataChanged?() } }
+
+    /// Everything that lives in Chronicles, as records.
+    var smithRecords: [SmithRecord] {
+        aboutYou.facts.map(SmithRecord.fact) + aboutYou.dontLearn.map(SmithRecord.dontLearn)
+            + letters.map(SmithRecord.letter) + conversations.map(SmithRecord.conversation)
+    }
+
+    /// What Chronicles holds, now this device's copy (kept for when it's locked or offline).
+    func applySmithRecords(_ records: [SmithRecord]) {
+        applyingFromChronicles = true
+        defer { applyingFromChronicles = false }
+        var about = aboutYou
+        about.facts = records.compactMap { if case .fact(let f) = $0 { f } else { nil } }
+        about.dontLearn = records.compactMap { if case .dontLearn(let d) = $0 { d } else { nil } }
+        if about != aboutYou { aboutYou = about }
+        let newLetters = records.compactMap { if case .letter(let l) = $0 { l } else { nil } }.sorted { $0.date < $1.date }
+        if newLetters != letters { letters = newLetters; saveLetters() }
+        let newConversations = records.compactMap { if case .conversation(let c) = $0 { c } else { nil } }.sorted { $0.day < $1.day }
+        if newConversations != conversations { conversations = newConversations; saveConversations() }
+    }
 
     // MARK: sync
 

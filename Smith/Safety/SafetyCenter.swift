@@ -60,7 +60,12 @@ final class SafetyCenter {
     }
 
     /// Ask for the 18+ confirmation before anything is sent.
-    var needsConsent: Bool { !hasConsent && enforcement.level != .blocked }
+    var needsConsent: Bool { !isChecking && !hasConsent && enforcement.level != .blocked }
+
+    /// Just signed in and Chronicles hasn't answered yet: nothing is decided
+    /// (no consent screen flashing up before the shared confirmation arrives).
+    var isChecking: Bool { chronicles.isUnlocked && !statusChecked }
+    private(set) var statusChecked = false
 
     /// Why AI can't be used right now, or nil.
     var unavailableReason: String? {
@@ -81,8 +86,18 @@ final class SafetyCenter {
 
     /// After unlocking, and now and then: the shared standing from Chronicles.
     func refresh() async {
-        guard chronicles.isUnlocked else { server = nil; apply(); return }
-        if let s = try? await chronicles.aiStatus() { server = s }
+        guard chronicles.isUnlocked else { server = nil; statusChecked = false; apply(); return }
+        // At most a few seconds: a slow answer never holds the app up
+        let timeout = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(6))
+            guard let self, !Task.isCancelled, !self.statusChecked, self.chronicles.isUnlocked else { return }
+            self.statusChecked = true
+            self.apply()
+        }
+        if let status = try? await chronicles.aiStatus() { server = status }
+        timeout.cancel()
+        // Answered or not (an older server), the decision can be made now
+        statusChecked = true
         apply()
     }
 
@@ -112,7 +127,7 @@ final class SafetyCenter {
 
     #if DEBUG
     /// Screenshots only: past the confirmation without saving it.
-    func debugSkipConsent() { local.consentVersion = AIChatStatus.consentVersion; local.consentAt = Date(); apply() }
+    func debugSkipConsent() { local.consentVersion = AIChatStatus.consentVersion; local.consentAt = Date(); statusChecked = true; apply() }
     #endif
 
     // MARK: this conversation

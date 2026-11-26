@@ -44,9 +44,17 @@ final class ChroniclesConnection {
 
     static let defaultServer = "https://mydailychronicles.com"
 
+    /// Memories, letters and summaries, kept in Chronicles so every device has the same.
+    @ObservationIgnored private(set) var cloud: SmithCloud!
+
     init(store: SmithStore) {
         self.store = store
         state = store.settings.chroniclesEmail == nil ? .notSetUp : .locked
+        cloud = SmithCloud(store: store,
+                           writer: { [unowned self] in
+                               if let session = self.session, let client = self.client { ChroniclesWriter(client: client, session: session) } else { nil }
+                           },
+                           account: { [unowned self] in self.isUnlocked ? self.store.settings.chroniclesEmail : nil })
     }
 
     var isUnlocked: Bool { state == .unlocked }
@@ -123,6 +131,7 @@ final class ChroniclesConnection {
             Self.forgetQuickUnlock()
         }
         session = nil; sync = nil; pending = nil
+        cloud.signedOut()
         undoables = []
         APIKeys.setChroniclesKey(nil)
         if state != .notSetUp { state = .locked }
@@ -296,6 +305,8 @@ final class ChroniclesConnection {
             for rec in updated { merged[rec.id] = rec }
             for id in r.removedJournalIDs { merged[id] = nil }
             store.replaceChronicles(r.snapshot, journal: merged.values.sorted { $0.day < $1.day })
+            // Memories, letters and summaries: the same on every device
+            await cloud.synced(remote: r.smithRecords, topics: r.smithTopicIDs)
             lastSync = Date()
             lastError = nil
             rekeying = false

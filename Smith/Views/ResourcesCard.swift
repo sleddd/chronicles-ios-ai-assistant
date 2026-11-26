@@ -121,3 +121,14 @@ struct ConsentView: View {
         }
     }
 }
+
+/// A moment after signing in, while Smith hears back from Chronicles.
+struct CheckingView: View {
+    var body: some View {
+        ZStack {
+            GlowBackground()
+            ProgressView().controlSize(.large).tint(Theme.teal)
+        }
+        .environment(\.colorScheme, .dark)
+    }
+}

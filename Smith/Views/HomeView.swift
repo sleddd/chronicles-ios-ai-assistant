@@ -198,7 +198,7 @@ struct HomeView: View {
             Button { app.sheet = .settings } label: { Label("Settings", systemImage: "gearshape") }
             Divider()
             Button { importing = true } label: { Label("Import now", systemImage: "square.and.arrow.down") }
-            Button { Task { await app.sync.syncNow(); if app.chronicles.isUnlocked { await app.chronicles.refresh() } } } label: {
+            Button { Task { await app.chronicles.refresh() } } label: {
                 Label("Sync now", systemImage: "arrow.triangle.2.circlepath")
             }
             Divider()

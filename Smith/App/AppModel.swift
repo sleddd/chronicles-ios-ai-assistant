@@ -107,7 +107,7 @@ final class AppModel {
     /// On launch and whenever the app comes forward.
     func becameActive() async {
         brain.refreshHeadline()
-        sync.start()
+        // (Mac ↔ iPad now share memories and letters through Chronicles; the local-network sync is retired)
         chronicles.checkAutoLock()
         await safety.refresh()
         if chronicles.isUnlocked { await chronicles.refresh() }
@@ -216,7 +216,6 @@ final class AppModel {
                 pendingOlderImport = nil
                 deleteSourceOffer = url
                 brain.refreshHeadline()
-                sync.start()
             } catch Importer.ImportError.older {
                 pendingOlderImport = url
             } catch {

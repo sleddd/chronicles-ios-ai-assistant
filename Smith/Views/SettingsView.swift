@@ -371,39 +371,17 @@ struct SettingsView: View {
     }
 
     @ViewBuilder private var syncSection: some View {
-        SectionLabel("Sync with \(isMac ? "iPad" : "Mac")")
+        SectionLabel("Your devices")
         GlassCard {
-            switch app.sync.status {
-            case .waitingForPair(let code):
-                Text("On your Mac, open Settings → Sync and enter:").font(Theme.rounded(13))
-                Text(code).font(.system(size: 40, weight: .light, design: .monospaced)).tracking(6)
-                Button("Cancel") { app.sync.cancelPairing() }.buttonStyle(.plain).foregroundStyle(Theme.dim)
-            default:
-                if let p = app.sync.peerName { Text("Nearby: \(p)").font(Theme.rounded(13)).foregroundStyle(Theme.dim) }
-                if app.sync.isPaired {
-                    Button("Sync now") { Task { await app.sync.syncNow() } }.buttonStyle(.plain).foregroundStyle(Theme.violet)
-                    if let last = app.store.lastSync { Caps("Last synced \(last.formatted(date: .abbreviated, time: .shortened))", size: 8, color: Theme.faint) }
-                    Button("Export Smith data (backup file)…") {
-                        if let d = try? app.store.exportBackup() { exportingBackup = SmithDataDocument(data: d) }
-                    }.buttonStyle(.plain).foregroundStyle(Theme.violet)
-                    Button("Unpair") { app.sync.unpair() }.buttonStyle(.plain).foregroundStyle(Theme.dim)
-                } else if isMac {
-                    Text("On the iPad, open Settings → Sync → Pair. Then enter the code it shows:").font(Theme.rounded(13))
-                    HStack {
-                        TextField("123456", text: $pairCode).textFieldStyle(.plain).font(.system(size: 22, design: .monospaced))
-                        Button("Pair") { Task { await app.sync.pair(code: pairCode) } }.buttonStyle(.plain).foregroundStyle(Theme.violet)
-                    }
-                } else {
-                    Button("Pair with my Mac") { app.sync.beginPairing() }.buttonStyle(.plain).foregroundStyle(Theme.violet)
-                }
+            Text("Memories, letters and conversation summaries are kept in Chronicles, sealed with your Chronicles key, so every device you sign in on has the same ones.")
+                .font(Theme.rounded(13)).foregroundStyle(Theme.dim).fixedSize(horizontal: false, vertical: true)
+            Text("In Chronicles they're the topics \(SmithTopics.all.map { "“\($0)”" }.joined(separator: ", ")). You can read and edit them there too.")
+                .font(Theme.rounded(13)).foregroundStyle(Theme.dim).fixedSize(horizontal: false, vertical: true)
+            if let p = app.chronicles.cloud.lastProblem {
+                Text("Last sync problem: \(p)").font(Theme.rounded(12)).foregroundStyle(Theme.rose)
             }
-            switch app.sync.status {
-            case .syncing: ProgressView().controlSize(.small)
-            case .done(let m): Text(m).font(Theme.rounded(12)).foregroundStyle(Theme.teal)
-            case .failed(let m): Text(m).font(Theme.rounded(12)).foregroundStyle(Theme.rose)
-            default: EmptyView()
-            }
-            Caps("Directly between your devices on your own network. Your API key and the conversation in progress never sync.", size: 8, color: Theme.faint)
+            Button(app.chronicles.syncing ? "Syncing…" : "Sync now") { Task { await app.chronicles.refresh() } }
+                .buttonStyle(.plain).foregroundStyle(Theme.violet).disabled(app.chronicles.syncing)
         }
     }
 

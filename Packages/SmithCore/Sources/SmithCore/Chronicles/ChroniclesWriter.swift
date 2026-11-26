@@ -30,7 +30,8 @@ public struct ChroniclesWriter: Sendable {
 
     // MARK: entries
 
-    public func createEntry(content: String, metadata: JSONValue, now: Date = Date()) async throws -> Int {
+    /// `owned`: Smith's own record (memories, letters, summaries), which it may edit and delete later.
+    public func createEntry(content: String, metadata: JSONValue, owned: Bool = false, now: Date = Date()) async throws -> Int {
         let ids = try await client.call("POST", "/api/entries/ids", ["count": 1], session).body["ids"]?.array ?? []
         guard let id = ids.first?.int else { throw ChroniclesError.server(500, "No entry id") }
         var meta = metadata.object ?? [:]
@@ -39,11 +40,13 @@ public struct ChroniclesWriter: Sendable {
             meta["_createdAt"] = .string(iso.string(from: now))
         }
         let enc = try ChroniclesCrypto.encryptPost(content: content, metadata: .object(meta), id: id, key: session.key)
-        try await client.call("POST", "/api/entries", [
+        var body: [String: JSONValue] = [
             "id": .number(Double(id)), "format": 3, "isEncrypted": true,
             "contentEncrypted": .string(enc.contentEncrypted), "contentIv": .string(enc.contentIv),
             "metadataEncrypted": .string(enc.metadataEncrypted), "metadataIv": .string(enc.metadataIv),
-        ], session)
+        ]
+        if owned { body["assistantOwned"] = true }
+        try await client.call("POST", "/api/entries", .object(body), session)
         return id
     }
 
@@ -61,6 +64,42 @@ public struct ChroniclesWriter: Sendable {
             "metadataEncrypted": .string(enc.metadataEncrypted), "metadataIv": .string(enc.metadataIv),
         ], session)
         return (current.content, current.metadata)
+    }
+
+    /// Creates one of Smith's topics, sealed the way Chronicles seals topics
+    /// (reserve an id, seal {name, icon} to it, then create). Returns its id.
+    public func createTopic(named name: String) async throws -> Int {
+        let ids = try await client.call("POST", "/api/topics/ids", ["count": 1], session).body["ids"]?.array ?? []
+        guard let id = ids.first?.int else { throw ChroniclesError.server(500, "No topic id") }
+        let sealed = try ChroniclesCrypto.sealRecord(kind: ChroniclesCrypto.RecordKind.topic, id: ChroniclesCrypto.topicRecordID(id),
+                                                     record: ["name": .string(name), "icon": .null], key: session.key)
+        let answer = try await client.call("POST", "/api/topics", [
+            "id": .number(Double(id)), "payload": .string(sealed.payload), "iv": .string(sealed.iv), "format": 2,
+        ], session, allow: [200, 201]).body
+        // The answer must be for the id the name was sealed to
+        guard answer["id"]?.int == id else { throw ChroniclesError.server(500, "Topic answer doesn’t match") }
+        return id
+    }
+
+    // MARK: Smith's records
+
+    public func createSmithRecord(_ record: SmithRecord, topicID: Int) async throws -> Int {
+        let e = record.entry(topicID: topicID)
+        return try await createEntry(content: e.content, metadata: e.metadata, owned: true)
+    }
+
+    public func updateSmithRecord(entryID: Int, _ record: SmithRecord, topicID: Int) async throws {
+        let e = record.entry(topicID: topicID)
+        _ = try await updateEntry(id: entryID) { content, meta in
+            content = e.content
+            // Keep whatever else Chronicles stored on the entry; replace Smith's fields
+            meta["_taxonomyId"] = .number(Double(topicID))
+            meta["_customFields"] = e.metadata["_customFields"]
+        }
+    }
+
+    public func deleteSmithRecord(entryID: Int) async throws {
+        try await client.call("DELETE", "/api/entries/\(entryID)", nil, session)
     }
 
     // MARK: doses

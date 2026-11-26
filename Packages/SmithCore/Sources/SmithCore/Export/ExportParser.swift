@@ -205,6 +205,8 @@ public enum ExportParser {
             "habit": "habit", "habits": "habit",
         ]
         if let k = map[n] { return k }
+        // Smith's own topics (memories, letters, summaries): not journal, not plan data
+        if SmithTopics.which(n) != nil { return "smith" }
         if n.contains("time track") || n.hasPrefix("timesheet") || n == "time log" || n == "time tracker" { return "time_tracking" }
         return nil
     }

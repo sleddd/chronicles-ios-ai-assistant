@@ -83,6 +83,7 @@ struct RootView: View {
     var body: some View {
         Group {
             if app.chronicles.isLocked { LockView() }
+            else if app.safety.isChecking { CheckingView() }
             else if app.safety.needsConsent { ConsentView() }
             else { HomeView() }
         }
@@ -106,6 +107,7 @@ struct PanelView: View {
     var body: some View {
         Group {
             if app.chronicles.isLocked { LockView(compact: true) }
+            else if app.safety.isChecking { CheckingView() }
             else if app.safety.needsConsent { ConsentView() }
             else { HomeView(compact: true) }
         }
@@ -132,7 +134,7 @@ struct MenuBarContent: View {
         }
         Divider()
         Button("Import Chronicles export…") { openWindow(id: "main"); NSApp.activate(); NotificationCenter.default.post(name: .smithImport, object: nil) }
-        if app.sync.isPaired { Button("Sync with iPad") { Task { await app.sync.syncNow() } } }
+        if app.chronicles.isUnlocked { Button("Sync with Chronicles") { Task { await app.chronicles.refresh() } } }
         if app.store.settings.macWakeWord {
             Button("Pause \"Hey Smith\" for 1 hour") { WakeWordListener.shared.pause() }
         }

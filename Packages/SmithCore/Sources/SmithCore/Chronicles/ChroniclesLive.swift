@@ -356,6 +356,10 @@ public actor ChroniclesLiveSync {
         public var anthropicKey: String?
         /// The dashboard's first place (Chronicles' home city), for the weather.
         public var homePlace: HomePlace?
+        /// Smith's own records (memories, letters, summaries) as they are in Chronicles.
+        public var smithRecords: [RemoteSmithRecord] = []
+        /// Smith's topics that exist, by name.
+        public var smithTopicIDs: [String: Int] = [:]
     }
 
     var journalIDs: Set<Int> = []
@@ -483,9 +487,20 @@ public actor ChroniclesLiveSync {
             "finance": ["bills": .array(bills)],
         ]
         let parsed = try ExportParser.parse(try doc.encoded(sortedKeys: false), now: now)
-        return Result(snapshot: parsed.snapshot, journal: parsed.journal, removedJournalIDs: Set(removed.map(String.init)),
-                      isFullLoad: full, hiddenTopicIDs: hiddenTopics, anthropicKey: Self.anthropicKey(settings["aiConfig"]),
-                      homePlace: HomePlace(settings["dashboardConfig"]?["places"]?.array?.first))
+        var result = Result(snapshot: parsed.snapshot, journal: parsed.journal, removedJournalIDs: Set(removed.map(String.init)),
+                            isFullLoad: full, hiddenTopicIDs: hiddenTopics, anthropicKey: Self.anthropicKey(settings["aiConfig"]),
+                            homePlace: HomePlace(settings["dashboardConfig"]?["places"]?.array?.first))
+        // Smith's own topics and what's in them (newest first)
+        for (id, name) in topicNames { if let t = SmithTopics.which(name) { result.smithTopicIDs[t] = id } }
+        let smithTopic = Dictionary(uniqueKeysWithValues: result.smithTopicIDs.map { ($0.value, $0.key) })
+        result.smithRecords = entries.values.compactMap { e -> (Date, RemoteSmithRecord)? in
+            guard let t = e.metadata["_taxonomyId"]?.int, let topic = smithTopic[t] else { return nil }
+            let updated = SmithRecord.date(.string(e.updatedAt)) ?? SmithRecord.date(.string(e.createdAt)) ?? .distantPast
+            guard let rec = SmithRecord.from(content: e.content, metadata: e.metadata, topic: topic, entryID: e.id, updatedAt: updated) else { return nil }
+            let owned = e.metadata["_customFields"]?["smithKind"]?.string != nil
+            return (updated, RemoteSmithRecord(entryID: e.id, record: rec, owned: owned))
+        }.sorted { $0.0 > $1.0 }.map(\.1)
+        return result
     }
 
     /// Only the Anthropic key, and only when AI is on there; other providers aren't used by Smith.
