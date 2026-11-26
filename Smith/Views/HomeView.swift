@@ -177,18 +177,19 @@ struct HomeView: View {
         return Button {
             if connected { app.sheet = .settings } else { app.chronicles.beginSetup() }
         } label: {
-            HStack(spacing: 10) {
+            // Just the book and a dot: teal when connected
+            HStack(spacing: 8) {
                 Image(systemName: "book.closed").foregroundStyle(Theme.teal)
-                if !compact { Text(connected ? "Chronicles connected" : "Connect to Chronicles").foregroundStyle(Theme.text) }
-                if connected { Circle().fill(Theme.teal).frame(width: 7, height: 7) }
+                Circle().fill(connected ? Theme.teal : Theme.faint).frame(width: 7, height: 7)
             }
-            .font(Theme.rounded(compact ? 13 : 15))
-            .padding(.horizontal, 16).frame(height: compact ? 36 : 44)
+            .font(.system(size: compact ? 14 : 17))
+            .padding(.horizontal, 14).frame(height: compact ? 36 : 44)
             .background(Color.black.opacity(0.25), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(.white.opacity(0.13)))
         }
         .buttonStyle(.plain)
-        .help(connected ? "Signed in to Chronicles" : "Sign in with your Chronicles account")
+        .help(connected ? "Chronicles connected" : "Connect to Chronicles")
+        .accessibilityLabel(connected ? "Chronicles connected" : "Connect to Chronicles")
     }
 
     /// Settings, the data (import, sync) and the account (lock, sign out).
