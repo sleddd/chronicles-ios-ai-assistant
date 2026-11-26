@@ -6,7 +6,7 @@ struct TodaySheet: View {
 
     var body: some View {
         GlassSheet(title: "Today") {
-            if let o = app.brain.context().overview {
+            if let o = app.brain.overviewForDisplay() {
                 SectionLabel("Events")
                 GlassCard {
                     if o.events.isEmpty { Text("Nothing on the calendar.").foregroundStyle(Theme.dim) }
@@ -199,7 +199,16 @@ struct AboutYouView: View {
 
             if !store.aboutYou.dontLearn.isEmpty {
                 SectionLabel("Won't learn again")
-                Text(store.aboutYou.dontLearn.map(\.marker).joined(separator: " · ")).font(Theme.rounded(12)).foregroundStyle(Theme.dim)
+                // Each can be removed: these words go along with every request, so they're yours to clear
+                ForEach(store.aboutYou.dontLearn) { d in
+                    HStack {
+                        Text(d.marker).font(Theme.rounded(12)).foregroundStyle(Theme.dim)
+                        Spacer()
+                        Button { store.aboutYou.removeDontLearn(d.id) } label: { Image(systemName: "xmark.circle") }
+                            .buttonStyle(.plain).foregroundStyle(Theme.dim)
+                            .accessibilityLabel("Remove \(d.marker)")
+                    }
+                }
             }
 
             Button("Clear everything") { confirmClear = true }.buttonStyle(.plain).foregroundStyle(Theme.rose).font(Theme.rounded(13, .medium)).padding(.top, 24)

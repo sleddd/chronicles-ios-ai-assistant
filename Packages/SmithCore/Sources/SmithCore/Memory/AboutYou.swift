@@ -112,7 +112,12 @@ public struct AboutYouStore: Codable, Equatable, Sendable {
     public mutating func clearAll(at: Date = Date()) {
         tombstones += facts.map { Tombstone(id: $0.id, deletedAt: at) }
         facts = []
+        // The markers hold words from deleted facts and go to Claude with every request
+        dontLearn = []
     }
+
+    /// Removes one "won't learn again" marker (it may be learned again after this).
+    public mutating func removeDontLearn(_ id: UUID) { dontLearn.removeAll { $0.id == id } }
 
     /// A general label for a deleted fact: its category and first few words, e.g. "likes: coffee after".
     public static func marker(for f: Fact) -> String {
@@ -170,8 +175,11 @@ public struct AboutYouStore: Codable, Equatable, Sendable {
 
     /// The "About you" block for Smith's context.
     public func contextText() -> String? {
-        let use = facts.sorted { ($0.confirmed ? 0 : 1, $0.updatedAt) < ($1.confirmed ? 0 : 1, $1.updatedAt) }
-            .prefix(Self.maxInContext)
+        // Confirmed first, and within each the most recent: past the limit it is the
+        // oldest that drop out, never what they just asked Smith to remember
+        let use = facts.sorted { a, b in
+            a.confirmed != b.confirmed ? a.confirmed : a.updatedAt > b.updatedAt
+        }.prefix(Self.maxInContext)
         guard !use.isEmpty else { return nil }
         var lines = ["What you know about them (use it naturally; don't recite it back):"]
         for c in Fact.Category.allCases {
@@ -180,8 +188,8 @@ public struct AboutYouStore: Codable, Equatable, Sendable {
             lines.append("\(c.label):")
             lines += items.map { "- \($0.text)\($0.confirmed ? "" : " (tentative; you may check it lightly)")" }
         }
-        let skip = dontLearn.map(\.marker)
-        if !skip.isEmpty { lines.append("Don't learn or bring up again: " + skip.joined(separator: "; ")) }
+        // The "won't learn again" markers are not sent: they hold words from facts that
+        // were deleted. They do their work here (`note` and `suggest` drop a match).
         return lines.joined(separator: "\n")
     }
 }

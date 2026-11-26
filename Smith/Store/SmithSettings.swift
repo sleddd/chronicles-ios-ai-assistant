@@ -65,6 +65,10 @@ struct SmithSettings: Codable, Equatable {
     /// Unlock with Face ID / Touch ID within the same Chronicles session.
     var quickUnlock = false
 
+    /// Words and phrases Smith must never use, added by the person (on top of the built-in list).
+    var customBannedPhrases: [String] = []
+    var bannedPhrases: [String] { BannedPhrases.all + customBannedPhrases.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty } }
+
     /// The stats card on the home screen can be hidden.
     var statsHidden = false
 

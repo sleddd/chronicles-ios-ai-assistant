@@ -61,7 +61,7 @@ public struct SmithContext: Sendable {
         f.dateFormat = "EEEE d MMMM yyyy, HH:mm"
         var parts = ["Now: \(f.string(from: now)) (\(timeZone.identifier))."]
         if let n = snapshot?.displayName { parts.append("Their name: \(n).") }
-        if let weatherLine { parts.append("Weather: \(weatherLine)") }
+        if let weatherLine { parts.append("Weather (bring it up only if they ask, or in the morning briefing): \(weatherLine)") }
         if let snapshot, let o = overview {
             let ef = DateFormatter(); ef.timeZone = timeZone; ef.dateFormat = "EEEE d MMMM 'at' HH:mm"; ef.locale = Locale(identifier: "en_GB")
             parts.append("Chronicles data as of \(ef.string(from: snapshot.exportedAt)).")

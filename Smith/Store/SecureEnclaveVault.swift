@@ -19,11 +19,21 @@ nonisolated enum SecureEnclaveVault {
 
     static var isAvailable: Bool { SecureEnclave.isAvailable }
 
-    private static func handleURL(_ lock: Lock) -> URL { EncryptedFile.folder.appendingPathComponent("se-\(lock.rawValue).handle") }
+    /// The presence key made before biometry-only ("se-presence.handle") allowed the
+    /// device passcode; a new key under the stricter rule gets a new name.
+    private static func handleURL(_ lock: Lock) -> URL {
+        EncryptedFile.folder.appendingPathComponent(lock == .presence ? "se-presence-2.handle" : "se-\(lock.rawValue).handle")
+    }
+
+    /// Touch ID / Face ID is set up on this device.
+    static var hasBiometry: Bool { LAContext().canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) }
 
     private static func accessControl(_ lock: Lock) throws -> SecAccessControl {
         var error: Unmanaged<CFError>?
-        let flags: SecAccessControlCreateFlags = lock == .presence ? [.privateKeyUsage, .userPresence] : [.privateKeyUsage]
+        // Presence: the fingerprints or face enrolled now, and nothing else. The device
+        // passcode is not enough (someone who knows it would get the Chronicles key),
+        // and enrolling a new finger makes the sealed copy unusable.
+        let flags: SecAccessControlCreateFlags = lock == .presence ? [.privateKeyUsage, .biometryCurrentSet] : [.privateKeyUsage]
         guard let ac = SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, flags, &error) else {
             throw error!.takeRetainedValue() as Error
         }

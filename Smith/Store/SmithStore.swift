@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Observation
 import SmithCore
 
@@ -27,10 +28,39 @@ final class SmithStore {
     var lastSync: Date? { didSet { UserDefaults.standard.set(lastSync, forKey: "lastSync") } }
     var peerHasNewer = false
 
-    init() {
+    /// False while the storage key can't be read (see `Keychain.storageKey`): what is
+    /// in memory is then just defaults, and saving it would write over the real files.
+    private(set) var loaded = false
+    /// Memories, letters or summaries are on the disk but couldn't be opened. Smith's
+    /// copy in Chronicles must then be taken as it is, never "tidied" to match an empty device.
+    private(set) var smithRecordsUnreadable = false
+    /// After a late load, for the parts that read the settings when they were made.
+    var onLoaded: (() -> Void)?
+    /// After "Erase everything": the agreement with Chronicles goes too.
+    var onErased: (() -> Void)?
+
+    init() { load() }
+
+    /// Called when the app comes forward: loads what couldn't be read at launch.
+    func loadIfNeeded() {
+        guard !loaded, EncryptedFile.isAvailable else { return }
+        load()
+        onLoaded?()
+    }
+
+    private func load() {
+        guard EncryptedFile.isAvailable else { return }
+        // Loading is not a change: nothing is saved back (`loaded` is still false, so
+        // `save` does nothing) or sent to Chronicles from here
+        applyingFromChronicles = true
+        defer { applyingFromChronicles = false; loaded = true }
+        let about = EncryptedFile.read(AboutYouStore.self, "about-you.smith", defaults: AboutYouStore())
+        smithRecordsUnreadable = (about == nil && EncryptedFile.exists("about-you.smith"))
+            || (EncryptedFile.exists("conversations.smith") && EncryptedFile.raw("conversations.smith") == nil)
+            || (EncryptedFile.exists("letters.smith") && EncryptedFile.raw("letters.smith") == nil)
         snapshot = EncryptedFile.read(ChroniclesSnapshot.self, "chronicles.smith")
         journal = EncryptedFile.read([JournalRecord].self, "journal-vault.smith") ?? []
-        aboutYou = EncryptedFile.read(AboutYouStore.self, "about-you.smith", defaults: AboutYouStore()) ?? AboutYouStore()
+        aboutYou = about ?? AboutYouStore()
         let convs = EncryptedFile.read(Records<ConversationSummary>.self, "conversations.smith")
         conversations = convs?.items ?? []; conversationTombstones = convs?.tombstones ?? []
         let lets = EncryptedFile.read(Records<Letter>.self, "letters.smith")
@@ -42,7 +72,10 @@ final class SmithStore {
 
     struct Records<T: Codable>: Codable { var items: [T]; var tombstones: [Tombstone] }
 
-    private func save<T: Encodable>(_ value: T, _ name: String) { EncryptedFile.write(value, name) }
+    private func save<T: Encodable>(_ value: T, _ name: String) {
+        guard loaded else { return }
+        EncryptedFile.write(value, name)
+    }
 
     // MARK: settings
 
@@ -228,11 +261,18 @@ final class SmithStore {
 
     /// Wipes everything Smith stores on this device.
     func eraseAll() {
-        for f in ["chronicles.smith", "journal-vault.smith", "about-you.smith", "conversations.smith", "letters.smith", "settings.smith"] {
-            EncryptedFile.delete(f)
-        }
+        // Erasing this device is not deleting from Chronicles: nothing here counts as a change to send
+        applyingFromChronicles = true
+        defer { applyingFromChronicles = false }
         snapshot = nil; journal = []; aboutYou = AboutYouStore(); conversations = []; letters = []
         conversationTombstones = []; letterTombstones = []; settings = SmithSettings()
+        // Last, so the saves the lines above trigger don't put files back
+        for f in ["chronicles.smith", "journal-vault.smith", "about-you.smith", "conversations.smith", "letters.smith",
+                  "settings.smith", "smith-cloud.smith"] {
+            EncryptedFile.delete(f)
+        }
+        smithRecordsUnreadable = false
+        onErased?()
     }
 }
 
@@ -244,5 +284,18 @@ enum SyncError: LocalizedError {
         case .badCode: "That code didn't match. Try again."
         case .connection(let m): m
         }
+    }
+}
+
+/// AES-GCM for the `.smithdata` backup file.
+enum AESGCMBox {
+    static func seal(_ data: Data, key: SymmetricKey) throws -> Data {
+        guard let combined = try AES.GCM.seal(data, using: key).combined else { throw SyncError.connection("Couldn't seal the file.") }
+        return Data("SMITH1".utf8) + combined
+    }
+
+    static func open(_ data: Data, key: SymmetricKey) throws -> Data {
+        guard data.starts(with: Data("SMITH1".utf8)) else { throw SyncError.connection("That isn't a Smith data file.") }
+        return try AES.GCM.open(AES.GCM.SealedBox(combined: data.dropFirst(6)), using: key)
     }
 }

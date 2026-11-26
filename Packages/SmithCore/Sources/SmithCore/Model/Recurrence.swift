@@ -21,7 +21,8 @@ public struct RepeatRule: Codable, Equatable, Sendable {
     public init?(fields cf: JSONValue) {
         guard let raw = cf["repeat"]?.string, let kind = Kind(rawValue: raw) else { return nil }
         let everyRaw = cf["repeatEvery"].flatMap { $0.double ?? $0.string.flatMap(Double.init) } ?? 1
-        let every = max(1, min(99, Int(everyRaw.isFinite ? everyRaw : 1)))
+        // Clamped as a Double first: Int(1e30) would stop the app
+        let every = Int(max(1, min(99, everyRaw.isFinite ? everyRaw : 1)))
         let days = Array(Set((cf["repeatDays"]?.array ?? []).compactMap { $0.int ?? $0.string.flatMap(Int.init) }
             .filter { (0...6).contains($0) })).sorted()
         let until = cf["repeatUntil"]?.string.flatMap { Day.isValid($0) && $0.count == 10 ? $0 : nil } ?? ""
@@ -39,7 +40,8 @@ public enum Recurrence {
         if first > last { return [] }
         var out: [String] = []
         func push(_ d: String) { if d >= first && d <= last && out.count < limit { out.append(d) } }
-        let every = rule.every
+        // A decoded rule could carry 0 or less, which would divide by zero or never advance
+        let every = max(1, rule.every)
 
         switch rule.kind {
         case .daily:

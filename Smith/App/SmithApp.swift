@@ -60,6 +60,8 @@ struct SmithApp: App {
         HotKey.shared.register()
         WakeWatcher.shared.onFirstWakeOfDay = {
             let app = AppModel.shared
+            // Locked: no panel and no Touch ID prompt on every wake; the briefing waits for an unlock
+            guard app.chronicles.isUnlocked else { return }
             guard app.store.settings.greetOnWake, app.store.settings.lastGreetingDay != Day.key() else { return }
             PanelController.shared.show { PanelView().environment(app) }
             app.morningBriefing()
@@ -68,8 +70,16 @@ struct SmithApp: App {
         WakeWordListener.shared.onWake = { after in
             let app = AppModel.shared
             PanelController.shared.show { PanelView().environment(app) }
-            if after.count > 3 { app.typedSpoken(after) } else { app.listenOnce() }
-            Task { try? await Task.sleep(for: .seconds(20)); if app.store.settings.macWakeWord { WakeWordListener.shared.start() } }
+            // Locked: the panel shows the unlock screen; what was said is not sent anywhere
+            if app.chronicles.isUnlocked {
+                if after.count > 3 { app.typedSpoken(after) } else { app.listenOnce() }
+            }
+            Task {
+                try? await Task.sleep(for: .seconds(20))
+                // Not while Smith is still listening to them: two taps on one microphone
+                while app.voice.state == .listening { try? await Task.sleep(for: .seconds(1)) }
+                if app.store.settings.macWakeWord { WakeWordListener.shared.start() }
+            }
         }
         if app.store.settings.macWakeWord { WakeWordListener.shared.start() }
     }
@@ -88,7 +98,14 @@ struct RootView: View {
             else { HomeView() }
         }
             .onOpenURL { app.openURL($0) }
-            .onChange(of: phase) { _, p in if p == .active { Task { await app.becameActive() } } }
+            .onChange(of: phase) { _, p in
+                if p == .active { Task { await app.becameActive() } }
+                if p == .background { app.chronicles.checkAutoLock() }
+            }
+            #if os(iOS)
+            // The app switcher keeps a picture of the screen: not of the day, the chat or a letter
+            .overlay { if phase != .active { Theme.ink.ignoresSafeArea() } }
+            #endif
             .onChange(of: app.chronicles.state) { _, _ in
                 app.brain.refreshHeadline()
                 Task { await app.safety.refresh() }
@@ -147,6 +164,7 @@ struct MenuBarContent: View {
 extension AppModel {
     /// Wake word with the request in the same breath: "Hey Smith, what's on today?"
     func typedSpoken(_ text: String) {
+        guard chronicles.isUnlocked else { return }
         showChat = true
         Task { await brain.send(text, spoken: true) }
     }

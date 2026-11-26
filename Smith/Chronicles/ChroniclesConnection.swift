@@ -57,6 +57,11 @@ final class ChroniclesConnection {
                            account: { [unowned self] in self.isUnlocked ? self.store.settings.chroniclesEmail : nil })
     }
 
+    /// The store was loaded after launch (it couldn't be read then): the account may be known after all.
+    func storeLoaded() {
+        if state == .notSetUp, store.settings.chroniclesEmail != nil { state = .locked }
+    }
+
     var isUnlocked: Bool { state == .unlocked }
     /// Smith only works connected to Chronicles: until it's signed in and unlocked,
     /// only the connect / unlock screen shows.
@@ -176,7 +181,8 @@ final class ChroniclesConnection {
 
     func noteActivity() { lastActivity = Date() }
 
-    /// Called every minute or so, and when the app goes to the background.
+    /// Called by the refresh loop while Smith is in front, when it comes forward
+    /// or goes to the background, and before anything Siri asks is answered.
     func checkAutoLock(now: Date = Date()) {
         guard state == .unlocked else { return }
         let minutes = store.settings.autoLockMinutes
@@ -188,7 +194,7 @@ final class ChroniclesConnection {
 
     private static let quickUnlockFile = "quick-unlock.se"
     static var hasQuickUnlock: Bool { SecureEnclaveVault.exists(quickUnlockFile) }
-    static var quickUnlockAvailable: Bool { SecureEnclaveVault.isAvailable }
+    static var quickUnlockAvailable: Bool { SecureEnclaveVault.isAvailable && SecureEnclaveVault.hasBiometry }
 
     /// "Touch ID", "Face ID", "Optic ID" or "your passcode".
     static var biometryName: String {
@@ -226,9 +232,23 @@ final class ChroniclesConnection {
         state = .unlocking
         let name = store.settings.name
         // The system prompt blocks until answered: off the main thread
-        let opened = await Task.detached { () -> Data? in
-            try? SecureEnclaveVault.load(name: "quick-unlock.se", lock: .presence, reason: "Unlock \(name)")
+        let file = Self.quickUnlockFile
+        let attempt = await Task.detached { () -> Result<Data?, Error> in
+            Result { try SecureEnclaveVault.load(name: file, lock: .presence, reason: "Unlock \(name)") }
         }.value
+        let opened: Data?
+        switch attempt {
+        case .success(let d): opened = d
+        case .failure(let error):
+            opened = nil
+            // Cancelled: try again whenever. Anything else (a new fingerprint was enrolled,
+            // or the copy was sealed under the older rule): the copy is no use any more
+            let cancelled = [LAError.userCancel, .appCancel, .systemCancel].contains { (error as? LAError)?.code == $0 }
+            if !cancelled {
+                Self.forgetQuickUnlock()
+                lastError = "Unlock with your password this once; \(Self.biometryName) will work again after that."
+            }
+        }
         guard let data = opened, let v = try? JSONValue.parse(data), let email = v["email"]?.string, let token = v["token"]?.string,
               let keyText = v["key"]?.string, let keyData = Data(base64Encoded: keyText) else {
             state = .locked
@@ -255,12 +275,18 @@ final class ChroniclesConnection {
     private func startRefreshLoop() {
         refreshTask?.cancel()
         refreshTask = Task { [weak self] in
+            // Changes made in Chronicles (or on the other device) arrive on their own:
+            // every 20 seconds one light "anything new?" request, and a sync only when
+            // there is. Doses, bills and settings aren't in that feed, so every 5 minutes anyway.
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(60))
+                try? await Task.sleep(for: .seconds(20))
                 guard let self, !Task.isCancelled else { return }
                 self.checkAutoLock()
-                let every: TimeInterval = self.rekeying ? 2 * 60 : 15 * 60
-                if self.state == .unlocked, Date().timeIntervalSince(self.lastSync ?? .distantPast) > every { await self.refresh() }
+                guard self.state == .unlocked, !self.syncing, let sync = self.sync else { continue }
+                let every: TimeInterval = self.rekeying ? 2 * 60 : 5 * 60
+                var due = Date().timeIntervalSince(self.lastSync ?? .distantPast) > every
+                if !due && !self.rekeying { due = await sync.hasChanges() }
+                if due { await self.refresh() }
             }
         }
     }
@@ -284,12 +310,21 @@ final class ChroniclesConnection {
         return try await c.reportAIRefusal(s)
     }
 
+    @ObservationIgnored private var refreshAgain = false
+
     func refresh() async {
-        guard let sync, !syncing else { return }
+        guard let sync else { return }
+        if syncing { refreshAgain = true; return }
+        defer {
+            if refreshAgain { refreshAgain = false; Task { await self.refresh() } }
+        }
         syncing = true
         defer { syncing = false }
         do {
             let r = try await sync.refresh()
+            // Locked (or signed in afresh) while this was under way: nothing from it is kept.
+            // Otherwise the account's Anthropic key would be put back in memory after the lock.
+            guard self.sync === sync, state == .unlocked else { return }
             hiddenTopicIDs = r.hiddenTopicIDs
             // The account's own Anthropic key (Chronicles → In-App AI), in memory while unlocked
             APIKeys.setChroniclesKey(r.anthropicKey)
@@ -354,6 +389,7 @@ final class ChroniclesConnection {
             })
         ctx.medication = { id in await sync?.medication(id) }
         ctx.hasDoseLink = { key in await sync?.hasDoseLink(key) ?? false }
+        ctx.wellnessEntryID = { day in await sync?.wellnessEntryID(day: day) }
         return ctx
     }
 

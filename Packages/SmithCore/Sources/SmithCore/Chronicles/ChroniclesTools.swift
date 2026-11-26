@@ -14,6 +14,8 @@ public struct ChroniclesActionContext: Sendable {
     public var medication: @Sendable (Int) async -> (name: String, fields: JSONValue)? = { _ in nil }
     /// Is a Meals row already linked to this dose?
     public var hasDoseLink: @Sendable (String) async -> Bool = { _ in false }
+    /// The entry id of a day's wellness check-in, if there is one.
+    public var wellnessEntryID: @Sendable (String) async -> Int? = { _ in nil }
     public var now: @Sendable () -> Date
     public var timeZone: TimeZone
 
@@ -278,7 +280,66 @@ public struct SetTaskStatusTool: LocalTool {
         guard input["explicit"]?.bool == true else { return askFirst("mark \"\(task.title)\" \(label)") }
         guard let writer = await ctx.writer() else { return "Smith is locked; unlock first." }
         let before = try await writer.updateEntry(id: id) { _, meta in ChroniclesShapes.setTaskStatus(&meta, to: status) }
-        let r = WriteResult(summary: "Marked \"\(task.title)\" \(label).", undo: .restoreEntry(id: id, content: before.content, metadata: before.metadata))
+        // Undo puts back the status only, not the whole task as it was (it may have been edited since)
+        let was = before.metadata["_customFields"]?.object ?? [:]
+        let statusKeys = ["isCompleted", "isInProgress", "isInReview", "isBacklog"]
+        let r = WriteResult(summary: "Marked \"\(task.title)\" \(label).",
+                            undo: .restoreFields(id: id, fields: Dictionary(uniqueKeysWithValues: statusKeys.map { ($0, was[$0]) })))
+        await ctx.didWrite(r)
+        return r.summary
+    }
+}
+
+public struct UpdateWellnessTool: LocalTool {
+    let ctx: ChroniclesActionContext
+    public init(_ ctx: ChroniclesActionContext) { self.ctx = ctx }
+    public var name: String { "update_wellness" }
+    public var description: String {
+        "Update their wellness check-in in Chronicles (the wellness card): mood, sleep, how rested they felt, water, stress, and the \"Your day\" answers. Set only what they told you; everything else stays as it is."
+    }
+    public var inputSchema: JSONValue {
+        let scale: JSONValue = ["type": "integer", "minimum": 1, "maximum": 5]
+        return ["type": "object", "properties": [
+            "mood": ["type": "integer", "minimum": 1, "maximum": 5, "description": "1 very low, 2 low, 3 okay, 4 good, 5 great"],
+            "sleep_hours": ["type": "number", "minimum": 0, "maximum": 14],
+            "rested": ["type": "integer", "minimum": 1, "maximum": 5, "description": "How rested on waking: 1 not at all … 5 fully"],
+            "water_glasses": ["type": "integer", "minimum": 0, "maximum": 20, "description": "Total glasses today"],
+            "add_water": ["type": "integer", "minimum": -5, "maximum": 10, "description": "Glasses to add to today's count"],
+            "stress": ["type": "integer", "minimum": 1, "maximum": 5, "description": "1 very low … 5 very high"],
+            "work_day": scale, "social": scale,
+            "procrastination": ["type": "integer", "minimum": 1, "maximum": 5, "description": "1 not at all … 5 all day"],
+            "eating": ["type": "string", "enum": ["too_little", "just_right", "too_much"]],
+            "woke_at_night": ["type": "boolean"], "dreamed": ["type": "boolean"],
+            "day": ["type": "string", "description": "YYYY-MM-DD; default today"],
+            "explicit": explicitProperty,
+        ], "required": ["explicit"], "additionalProperties": false]
+    }
+    public func run(_ input: JSONValue) async throws -> String {
+        func scale(_ k: String) -> Int? { input[k]?.int.map { max(1, min(5, $0)) } }
+        var set: [String: JSONValue] = [:]
+        var said: [String] = []
+        if let v = scale("mood") { set["moodScore"] = .number(Double(v)); said.append("mood \(WellnessDay.moods[v - 1])") }
+        if let v = input["sleep_hours"]?.double { let h = (max(0, min(14, v)) * 2).rounded() / 2; set["sleepHours"] = .number(h); said.append("slept \(h.formatted())h") }
+        if let v = scale("rested") { set["sleepQuality"] = .number(Double(v)); said.append("rested \(WellnessDay.rested[v - 1])") }
+        if let v = input["water_glasses"]?.int { set["waterGlasses"] = .number(Double(max(0, min(20, v)))); said.append("water \(v)") }
+        let add = input["add_water"]?.int ?? 0
+        if add != 0 { said.append(add > 0 ? "\(add) more water" : "\(-add) less water") }
+        if let v = scale("stress") { set["stress"] = .number(Double(v)); said.append("stress \(WellnessDay.stressWords[v - 1])") }
+        if let v = scale("work_day") { set["workDay"] = .number(Double(v)); said.append("work day \(WellnessDay.quality[v - 1])") }
+        if let v = scale("social") { set["social"] = .number(Double(v)); said.append("social \(WellnessDay.quality[v - 1])") }
+        if let v = scale("procrastination") { set["procrastination"] = .number(Double(v)); said.append("procrastinated \(WellnessDay.procrastinationWords[v - 1])") }
+        if let v = input["eating"]?.string, ["too_little", "just_right", "too_much"].contains(v) { set["eating"] = .string(v); said.append("ate \(v.replacingOccurrences(of: "_", with: " "))") }
+        if let v = input["woke_at_night"]?.bool { set["wokeAtNight"] = .bool(v); said.append(v ? "woke in the night" : "slept through") }
+        if let v = input["dreamed"]?.bool { set["dreamed"] = .bool(v); said.append(v ? "dreamed" : "no dreams") }
+        guard !set.isEmpty || add != 0 else { return "Nothing to update on the wellness card." }
+        let what = said.joined(separator: ", ")
+        guard input["explicit"]?.bool == true else { return askFirst("update your wellness card (\(what))") }
+        let topic = await ctx.topicID(["Wellness"])
+        if let topic, await ctx.hiddenTopicIDs().contains(topic) { return "They've kept Wellness from AI in Chronicles, so it can't be changed from here." }
+        guard let writer = await ctx.writer() else { return "Smith is locked; unlock first." }
+        let day = input["day"]?.string.flatMap { Day.isValid($0) ? String($0.prefix(10)) : nil } ?? ctx.today
+        let undo = try await writer.saveWellness(entryID: await ctx.wellnessEntryID(day), day: day, set: set, addWater: add, topicID: topic)
+        let r = WriteResult(summary: "Updated \(day == ctx.today ? "today's" : Day.short(day) + "'s") wellness card: \(what).", undo: undo)
         await ctx.didWrite(r)
         return r.summary
     }
@@ -313,13 +374,13 @@ public struct MarkBillPaidTool: LocalTool {
 
 public enum ChroniclesActionTools {
     public static func all(_ ctx: ChroniclesActionContext) -> [LocalTool] {
-        [LogMealTool(ctx), LogDoseTool(ctx), CheckHabitTool(ctx), SaveNoteTool(ctx), AddTaskTool(ctx), SetTaskStatusTool(ctx), MarkBillPaidTool(ctx)]
+        [LogMealTool(ctx), LogDoseTool(ctx), CheckHabitTool(ctx), SaveNoteTool(ctx), AddTaskTool(ctx), SetTaskStatusTool(ctx), MarkBillPaidTool(ctx), UpdateWellnessTool(ctx)]
     }
 
     /// Added to the persona when Smith is connected to Chronicles.
     public static let persona = """
-        You can act in their Chronicles: log meals and doses, check off habits, save notes, add tasks, mark tasks done \
-        and mark bills paid. When they directly tell you to do one of these ("Smith, log meal: oatmeal", "mark my vitamin \
+        You can act in their Chronicles: log meals and doses, check off habits, save notes, add tasks, mark tasks done, \
+        mark bills paid, and update their wellness card (mood, sleep, water, stress and the "Your day" answers). When they directly tell you to do one of these ("Smith, log meal: oatmeal", "mark my vitamin \
         D taken"), do it and say plainly what you did; they can undo it for two minutes. When you are only inferring it \
         ("I had oatmeal"), ask first in a natural way ("Want me to log that?"), and act only after they say yes. You \
         can't delete or change anything else; if they ask, say you can't and that they can do it in Chronicles.

@@ -40,7 +40,9 @@ public enum JSONValue: Codable, Equatable, Sendable {
 
     public var string: String? { if case .string(let s) = self { return s }; return nil }
     public var double: Double? { if case .number(let n) = self { return n }; return nil }
-    public var int: Int? { double.map { Int($0) } }
+    /// The whole part, or nil when it isn't a number an Int can hold (NaN, infinity, 1e30):
+    /// `Int(_:)` would stop the app on those, and these values come from outside.
+    public var int: Int? { double.flatMap { Int(exactly: $0.rounded(.towardZero)) } }
     public var bool: Bool? { if case .bool(let b) = self { return b }; return nil }
     public var array: [JSONValue]? { if case .array(let a) = self { return a }; return nil }
     public var object: [String: JSONValue]? { if case .object(let o) = self { return o }; return nil }

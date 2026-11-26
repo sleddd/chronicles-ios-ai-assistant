@@ -49,12 +49,8 @@
 	<string>1</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.productivity</string>
-	<key>NSBonjourServices</key>
-	<array>
-		<string>_smithsync._tcp</string>
-	</array>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>Smith syncs directly between your Mac and iPad on your own network.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Face ID unlocks Smith without typing your Chronicles password each time.</string>
 	<key>NSLocationUsageDescription</key>
 	<string>Smith uses your approximate location for the weather.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>

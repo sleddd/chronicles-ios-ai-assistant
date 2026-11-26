@@ -30,6 +30,8 @@ public struct DayOverview: Equatable, Sendable {
     public var priorities: [String]
     /// An in-progress goal worth a mention, with its nearest target date.
     public var goalMention: Goal?
+    /// Today's wellness check-in, if there is one.
+    public var wellness: WellnessDay? = nil
 
     public var openTasksToday: Int { tasksToday.filter(\.isOpen).count }
 
@@ -80,7 +82,7 @@ public struct DayOverview: Equatable, Sendable {
 
         return DayOverview(today: today, events: events, tasksToday: todays, overdue: overdue, deadlinesSoon: deadlines,
                            doses: doses, bills: BillsDue.upcoming(s.bills, today: today, days: billDays, privateIDs: privateBillIDs),
-                           priorities: priorities, goalMention: goal)
+                           priorities: priorities, goalMention: goal, wellness: s.wellness.first { $0.date == today })
     }
 
     static func taskOrder(_ a: PlanTask, _ b: PlanTask) -> Bool {
@@ -90,6 +92,7 @@ public struct DayOverview: Equatable, Sendable {
     /// Plain text for Smith's context. Facts only; Smith decides what to say.
     public func contextText(includeGoal: Bool = true) -> String {
         var lines: [String] = []
+        lines.append(wellness.map { "Wellness check-in today: \($0.line)." } ?? "Wellness check-in today: not filled in yet.")
         lines.append(events.isEmpty ? "Events today: none." : "Events today:\n" + events.map { e in
             let when = e.allDay ? "all day" : [e.time, e.endTime].compactMap { $0 }.joined(separator: "–")
             return "- \(when): \(e.title)\(e.isMeeting ? " (meeting)" : "")\(e.location.map { " at \($0)" } ?? "")"

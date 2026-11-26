@@ -196,6 +196,10 @@ struct HomeView: View {
     private var gearMenu: some View {
         Menu {
             Button { app.sheet = .settings } label: { Label("Settings", systemImage: "gearshape") }
+            Toggle(isOn: Binding(get: { app.store.settings.muted }, set: { on in
+                app.store.updateSettings { $0.muted = on }
+                if on { app.voice.stopSpeaking() }
+            })) { Label("Mute Smith (text only)", systemImage: "speaker.slash") }
             Divider()
             Button { importing = true } label: { Label("Import now", systemImage: "square.and.arrow.down") }
             Button { Task { await app.chronicles.refresh() } } label: {
@@ -219,7 +223,7 @@ struct HomeView: View {
 
     /// One glass card: the time with date and weather, events, tasks and priorities.
     private var statsCard: some View {
-        let o = app.brain.context().overview
+        let o = app.brain.overviewForDisplay()
         let nowHM = Date().formatted(.verbatim("\(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits)", timeZone: .current, calendar: .current))
         let remaining = o?.events.filter { $0.allDay || ($0.endTime ?? $0.time ?? "") >= nowHM } ?? []
         let next = remaining.first { !$0.allDay }
@@ -386,6 +390,7 @@ struct ChatView: View {
                     .padding(.horizontal, 22).padding(.vertical, 16)
                 }
                 .onChange(of: brain.lines) { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+                .onAppear { proxy.scrollTo("bottom", anchor: .bottom) }
             }
         }
         .sheet(item: $editing) { f in FactEditor(fact: f).environment(\.pageClose, nil) }
@@ -434,14 +439,25 @@ struct ChatView: View {
                 }
                 // Hear it again (loading while the voice is made, Stop while it plays)
                 let mine = replayingID == line.id
-                HearButton(busy: mine && app.voice.state == .speaking, loading: mine && app.voice.preparing, compact: true) {
-                    replayingID = line.id
-                    app.voice.preview(app.smithSpeaker, text: line.text)
-                } stop: { app.voice.stopSpeaking() }
-                .font(.system(size: 13))
-                .foregroundStyle(mine && app.voice.state == .speaking ? Theme.teal : Theme.faint)
+                HStack(spacing: 18) {
+                    HearButton(busy: mine && app.voice.state == .speaking, loading: mine && app.voice.preparing, compact: true) {
+                        replayingID = line.id
+                        app.voice.preview(app.smithSpeaker, text: line.text)
+                    } stop: { app.voice.stopSpeaking() }
+                    .font(.system(size: 13))
+                    .foregroundStyle(mine && app.voice.state == .speaking ? Theme.teal : Theme.faint)
+                    .help("Hear it again")
+                    if line.id == app.brain.lines.last?.id && app.brain.canRegenerate {
+                        Button { Task { await app.brain.regenerate() } } label: {
+                            HStack(spacing: 5) { Image(systemName: "arrow.clockwise"); Text("Regenerate") }
+                                .font(Theme.rounded(12, .medium)).fixedSize()
+                        }
+                        .buttonStyle(.plain).foregroundStyle(Theme.faint)
+                        .help("Answer again, differently")
+                    }
+                }
                 .padding(.leading, 14 + ChatBubble.tail)
-                .help("Hear it again")
+                if let sent = line.sent { SentDisclosure(info: sent).padding(.leading, 14 + ChatBubble.tail) }
             }
         case .note:
             Caps(line.text, size: 9, color: Theme.faint)
@@ -494,14 +510,19 @@ struct InputBar: View {
                 }
                 .buttonStyle(.plain).help("Stop (Esc)").transition(.opacity)
             }
-            // Talk: the same as tapping the orb
-            Button { app.orbTapped() } label: {
+            // Dictate into the box: what you say lands here to edit or add to before sending
+            // (while the orb is listening, this stops and moves your words here instead of sending)
+            Button { app.dictateToBox() } label: {
                 Image(systemName: listening ? "mic.fill" : "mic").font(.system(size: 17))
                     .foregroundStyle(listening ? Theme.teal : Theme.dim)
             }
-            .buttonStyle(.plain).help(listening ? "Finish talking" : "Talk")
-            Button { app.store.updateSettings { $0.muted.toggle() } } label: {
-                Image(systemName: app.store.settings.muted ? "speaker.slash" : "speaker.wave.2").foregroundStyle(Theme.dim)
+            .buttonStyle(.plain).help(listening ? "Stop and edit in the box" : "Dictate into the box")
+            Button {
+                app.store.updateSettings { $0.muted.toggle() }
+                if app.store.settings.muted { app.voice.stopSpeaking() }
+            } label: {
+                Image(systemName: app.store.settings.muted ? "speaker.slash" : "speaker.wave.2")
+                    .foregroundStyle(app.store.settings.muted ? Theme.amber : Theme.dim)
             }
             .buttonStyle(.plain).help(app.store.settings.muted ? "Text only (tap to hear replies)" : "Replies are spoken (tap for text only)")
         }
@@ -537,4 +558,59 @@ struct InputBar: View {
 extension Notification.Name {
     static let smithImport = Notification.Name("smith.import")
     static let smithTalk = Notification.Name("smith.talk")
+}
+
+/// Under each of Smith's replies: what was sent to Claude to write it. Collapsed;
+/// each part opens on its own.
+struct SentDisclosure: View {
+    let info: SentInfo
+    @State private var open = false
+    @State private var openParts: Set<UUID> = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button { withAnimation(.easeInOut(duration: 0.2)) { open.toggle() } } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold))
+                        .rotationEffect(.degrees(open ? 90 : 0))
+                    Text("What was sent to Claude").font(Theme.rounded(11, .medium))
+                    if !open { Text("· \(info.parts.count - 1) parts").font(Theme.rounded(11)).foregroundStyle(Theme.faint) }
+                }
+                .foregroundStyle(Theme.faint)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("See exactly what went to Claude for this reply")
+            if open {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(info.parts) { part in
+                        let partOpen = openParts.contains(part.id)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Button {
+                                if partOpen { openParts.remove(part.id) } else { openParts.insert(part.id) }
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: partOpen ? "minus" : "plus").font(.system(size: 8, weight: .bold)).foregroundStyle(Theme.teal)
+                                    Text(part.title).font(Theme.rounded(12, .medium)).foregroundStyle(Theme.dim)
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            if partOpen {
+                                Text(part.text)
+                                    .font(.system(size: 11, design: .monospaced)).foregroundStyle(Theme.dim).lineSpacing(3)
+                                    .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                                    .padding(10).frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Color.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            }
+                        }
+                    }
+                }
+                .padding(12)
+                .frame(maxWidth: 640, alignment: .leading)
+                .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(.white.opacity(0.07)))
+            }
+        }
+    }
 }

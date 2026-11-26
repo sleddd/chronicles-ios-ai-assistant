@@ -30,6 +30,7 @@ final class VoiceIO: NSObject {
     override init() {
         super.init()
         synth.delegate = self
+        watchForInterruptions()
     }
 
     // MARK: permissions
@@ -63,7 +64,14 @@ final class VoiceIO: NSObject {
     /// you talk, then calls `done` with everything that was said.
     func listen(done: @escaping (String) -> Void) {
         stopSpeaking()
+        permissionProblem = nil
         guard let recognizer, recognizer.isAvailable else { permissionProblem = "Speech recognition isn't available right now."; return }
+        // Smith says speech stays on the device, so it does: where this language has no
+        // on-device recognition, nothing is recorded rather than sent to Apple's servers
+        guard recognizer.supportsOnDeviceRecognition else {
+            permissionProblem = "On-device speech recognition isn't available for this device's language, so Smith can't listen. You can still type."
+            return
+        }
         cancelListening()
         onFinal = done
         partialTranscript = ""
@@ -77,6 +85,8 @@ final class VoiceIO: NSObject {
 
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
+        // No microphone (or it was unplugged): installing a tap with an empty format stops the app
+        guard format.sampleRate > 0, format.channelCount > 0 else { permissionProblem = "Smith can't find a microphone."; return }
         input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 1024, format: format,
                          block: Self.tap(box) { @Sendable [weak self] lvl in Task { @MainActor in self?.level = lvl } })
@@ -94,7 +104,7 @@ final class VoiceIO: NSObject {
         request?.endAudio()
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
-        req.requiresOnDeviceRecognition = recognizer.supportsOnDeviceRecognition
+        req.requiresOnDeviceRecognition = true
         req.addsPunctuation = true
         request = req
         box.set(req)
@@ -163,6 +173,7 @@ final class VoiceIO: NSObject {
         engine.inputNode.removeTap(onBus: 0)
         if state == .listening { state = .idle }
         level = 0
+        releaseSessionWhenIdle()
     }
 
     // Apple calls these from its own audio and speech threads, so they're built
@@ -293,6 +304,9 @@ final class VoiceIO: NSObject {
         let target = voice ?? smithVoice
         let clean = Self.speakable(target.performsEmotes ? Self.withAudioTags(sentence) : sentence)
         guard !clean.isEmpty else { show?.fire(); return }
+        // Listening (they tapped the orb while a reply was still arriving): shown, not said.
+        // Speaking here would flip the state to .speaking and leave the microphone running unseen.
+        if state == .listening { show?.fire(); return }
         if pending.isEmpty && inFlight == 0 {
             pendingVoice = target
             preparing = true
@@ -307,6 +321,9 @@ final class VoiceIO: NSObject {
         // A short gather at the start lets the first two sentences flow together.
         gatherTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(350))
+            // Stopped meanwhile: this gather belongs to speech that was cancelled, and
+            // must not clear (or start) the one that replaced it
+            guard !Task.isCancelled else { return }
             self?.gatherTask = nil
             self?.speakPending()
         }
@@ -396,9 +413,15 @@ final class VoiceIO: NSObject {
         u.preUtteranceDelay = 0
         u.postUtteranceDelay = 0
         inFlight += 1
+        liveUtterances.insert(ObjectIdentifier(u))
         if !shows.isEmpty { appleShows[ObjectIdentifier(u)] = shows }
         synth.speak(u)
     }
+
+    /// The utterances handed to the synthesizer and not yet finished or stopped. A
+    /// "finished" that arrives late, for speech already stopped, is not counted
+    /// against whatever is being said now.
+    private var liveUtterances: Set<ObjectIdentifier> = []
 
     private func playNext() {
         guard player?.isPlaying != true, !audioQueue.isEmpty else { return }
@@ -414,6 +437,9 @@ final class VoiceIO: NSObject {
         let ok = p.play()
         note("play \(ok) duration \(p.duration)")
         preparing = false
+        // Couldn't play (the audio route went away, a call came in): no "finished" will
+        // ever arrive, so move on now rather than stay "speaking" for good
+        guard ok else { elevenPieceEnded(); return }
         meterTimer?.invalidate()
         meterTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -452,12 +478,50 @@ final class VoiceIO: NSObject {
         // Whatever was waiting for its audio is shown now, so nothing is lost
         (waiting + audioQueue.flatMap(\.shows) + appleShows.values.flatMap { $0 }).forEach { $0.fire() }
         appleShows = [:]
+        liveUtterances = []
         audioQueue = []
         elevenFetching = false
         spokenSoFar = ""
         inFlight = 0
         if state == .speaking { state = .idle }
         level = 0
+        releaseSessionWhenIdle()
+    }
+
+    /// iPad: once Smith has been quiet for a moment, the audio session is given back,
+    /// so other apps' sound (music, a podcast) comes back up instead of staying ducked.
+    /// The short wait covers the gap between a reply ending and listening starting again.
+    private func releaseSessionWhenIdle() {
+        #if os(iOS)
+        releaseTask?.cancel()
+        releaseTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1.5))
+            guard !Task.isCancelled, let self, self.state == .idle, !self.engine.isRunning, self.inFlight == 0 else { return }
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
+        #endif
+    }
+    private var releaseTask: Task<Void, Never>?
+
+    /// A phone call, Siri, an alarm, or the microphone / headphones changing under us:
+    /// stop cleanly, so Smith is never left "speaking" or "listening" with nothing happening.
+    private func watchForInterruptions() {
+        let center = NotificationCenter.default
+        #if os(iOS)
+        center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
+            let began = (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) == AVAudioSession.InterruptionType.began.rawValue
+            guard began else { return }
+            MainActor.assumeIsolated { self?.stopSpeaking(); self?.cancelListening() }
+        }
+        #endif
+        center.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                // The input changed mid-sentence: the tap's format is stale, so listening ends here
+                guard let self, self.state == .listening else { return }
+                self.cancelListening()
+                self.permissionProblem = "The microphone changed. Tap to talk again."
+            }
+        }
     }
 
     /// Emotes in asterisks → ElevenLabs audio tags, which the v4 models perform:
@@ -469,6 +533,8 @@ final class VoiceIO: NSObject {
             "giggles": "giggles", "winces": "wincing", "rolls eyes": "playfully exasperated",
         ]
         var out = ""
+        // **bold** is emphasis, not an emote: its words are said
+        let s = s.replacingOccurrences(of: "**", with: "")
         var rest = Substring(s)
         while let r = rest.range(of: #"\*[^*\n]{1,40}\*"#, options: .regularExpression) {
             out += rest[..<r.lowerBound]
@@ -482,7 +548,9 @@ final class VoiceIO: NSObject {
     }
 
     static func speakable(_ s: String) -> String {
-        var t = s.replacingOccurrences(of: #"\*[^*]{1,60}\*"#, with: "", options: .regularExpression)
+        // **bold** keeps its words; an *emote* is on one line (two "* " bullets are not one)
+        var t = s.replacingOccurrences(of: "**", with: "")
+        t = t.replacingOccurrences(of: #"\*[^*\n]{1,60}\*"#, with: "", options: .regularExpression)
         t = t.replacingOccurrences(of: #"[#*_`>]"#, with: "", options: .regularExpression)
         t = t.unicodeScalars.filter { !$0.properties.isEmojiPresentation }.map(String.init).joined()
         return t.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -495,11 +563,18 @@ final class VoiceIO: NSObject {
         return voices.first { $0.quality == .premium } ?? voices.first { $0.quality == .enhanced } ?? AVSpeechSynthesisVoice(language: lang)
     }
 
+    /// Listing and sorting every installed voice is slow, and Settings asks on every
+    /// redraw: the list is kept for a minute (long enough to type, short enough to
+    /// notice a voice downloaded in System Settings).
     static var choosableVoices: [AVSpeechSynthesisVoice] {
-        AVSpeechSynthesisVoice.speechVoices()
+        if let c = voiceCache, Date().timeIntervalSince(c.at) < 60 { return c.voices }
+        let voices = AVSpeechSynthesisVoice.speechVoices()
             .filter { $0.language.hasPrefix(String(AVSpeechSynthesisVoice.currentLanguageCode().prefix(2))) }
             .sorted { ($0.quality.rawValue, $0.name) > ($1.quality.rawValue, $1.name) }
+        voiceCache = (Date(), voices)
+        return voices
     }
+    private static var voiceCache: (at: Date, voices: [AVSpeechSynthesisVoice])?
 
     /// Hear a voice (Settings), or a letter in Henry's voice.
     func preview(_ voice: Speaker, text: String) {
@@ -515,7 +590,9 @@ extension VoiceIO: AVSpeechSynthesizerDelegate {
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        Task { @MainActor in self.utteranceEnded() }
+        let key = ObjectIdentifier(utterance)
+        // Only one still counted: a late "finished" for speech that was stopped is ignored
+        Task { @MainActor in if self.liveUtterances.remove(key) != nil { self.utteranceEnded() } }
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, willSpeakRangeOfSpeechString characterRange: NSRange, utterance: AVSpeechUtterance) {
@@ -534,15 +611,25 @@ extension VoiceIO: AVSpeechSynthesizerDelegate {
         let done = onSpeechDone
         onSpeechDone = nil
         done?()
+        releaseSessionWhenIdle()
     }
 }
 
 extension VoiceIO: AVAudioPlayerDelegate {
+    // Only for the player that is playing now: one that was stopped and replaced says nothing
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        Task { @MainActor in self.note("finished \(flag)"); self.elevenPieceEnded() }
+        let key = ObjectIdentifier(player)
+        Task { @MainActor in
+            guard self.player.map(ObjectIdentifier.init) == key else { return }
+            self.note("finished \(flag)"); self.elevenPieceEnded()
+        }
     }
     nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
-        Task { @MainActor in self.note("decode error \(String(describing: error))"); self.elevenPieceEnded() }
+        let key = ObjectIdentifier(player)
+        Task { @MainActor in
+            guard self.player.map(ObjectIdentifier.init) == key else { return }
+            self.note("decode error \(String(describing: error))"); self.elevenPieceEnded()
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 import Foundation
 
 // What Smith keeps from Chronicles. Only the fields Smith needs: no task or
-// event notes, no finance amounts, no journal text, no wellness check-ins.
+// event notes, no finance amounts, no journal text, no wellness notes.
 
 public struct PlanTask: Codable, Equatable, Sendable, Identifiable {
     public enum Status: String, Codable, Sendable { case backlog, todo, inProgress, done }
@@ -130,6 +130,67 @@ public struct Vision: Codable, Equatable, Sendable {
 }
 
 /// Everything Smith keeps from one Chronicles export (journal text excluded — see `journal`).
+/// One day's wellness check-in (Chronicles' wellness card), without its notes.
+public struct WellnessDay: Codable, Equatable, Sendable {
+    public var entryID: String
+    public var date: String
+    public var mood = 0              // 1–5, 0 = not set
+    public var sleepHours = 0.0
+    public var sleepQuality = 0      // how rested, 1–5
+    public var water = 0
+    public var waterGoal = 8
+    public var stress = 0            // 1 very low – 5 very high
+    public var workDay = 0           // 1–5
+    public var social = 0            // 1–5
+    public var procrastination = 0   // 1 not at all – 5 all day
+    public var eating: String?       // too_little | just_right | too_much
+    public var wokeAtNight: Bool?
+    public var dreamed: Bool?
+
+    public init(entryID: String, date: String) { self.entryID = entryID; self.date = date }
+
+    init?(entryID: String, fields cf: JSONValue) {
+        guard let date = cf["date"]?.string, Day.isValid(date) else { return nil }
+        self.init(entryID: entryID, date: String(date.prefix(10)))
+        mood = cf["moodScore"]?.int ?? 0
+        sleepHours = cf["sleepHours"]?.double ?? 0
+        sleepQuality = cf["sleepQuality"]?.int ?? 0
+        water = cf["waterGlasses"]?.int ?? 0
+        waterGoal = cf["waterGoal"]?.int ?? 8
+        stress = cf["stress"]?.int ?? 0
+        workDay = cf["workDay"]?.int ?? 0
+        social = cf["social"]?.int ?? 0
+        procrastination = cf["procrastination"]?.int ?? 0
+        eating = cf["eating"]?.string.flatMap { $0.isEmpty ? nil : $0 }
+        wokeAtNight = cf["wokeAtNight"]?.bool
+        dreamed = cf["dreamed"]?.bool
+    }
+
+    static let moods = ["Very low", "Low", "Okay", "Good", "Great"]
+    static let quality = ["Poor", "Fair", "OK", "Good", "Great"]
+    static let rested = ["Not at all", "A little", "Somewhat", "Mostly", "Fully"]
+    static let stressWords = ["Very low", "Low", "Moderate", "High", "Very high"]
+    static let procrastinationWords = ["Not at all", "A little", "Some", "A lot", "All day"]
+
+    /// What's filled in, in words ("mood Good; slept 7h, rested Mostly; water 3 of 8 …").
+    public var line: String {
+        func word(_ v: Int, _ words: [String]) -> String? { (1...5).contains(v) ? words[v - 1] : nil }
+        var bits: [String] = []
+        if let m = word(mood, Self.moods) { bits.append("mood \(m)") }
+        if sleepHours > 0 { bits.append("slept \(sleepHours.formatted())h") }
+        if let r = word(sleepQuality, Self.rested) { bits.append("felt rested: \(r)") }
+        bits.append("water \(water) of \(waterGoal) glasses")
+        if let s = word(stress, Self.stressWords) { bits.append("stress \(s)") }
+        if let w = word(workDay, Self.quality) { bits.append("work day \(w)") }
+        if let s = word(social, Self.quality) { bits.append("social time \(s)") }
+        if let p = word(procrastination, Self.procrastinationWords) { bits.append("procrastinated \(p)") }
+        if let e = eating { bits.append("ate \(e.replacingOccurrences(of: "_", with: " "))") }
+        if let w = wokeAtNight { bits.append(w ? "woke in the night" : "slept through") }
+        if let d = dreamed { bits.append(d ? "remembers dreaming" : "no dreams remembered") }
+        return bits.joined(separator: "; ")
+    }
+}
+
 public struct ChroniclesSnapshot: Codable, Equatable, Sendable {
     public var exportedAt: Date
     public var displayName: String?
@@ -147,6 +208,8 @@ public struct ChroniclesSnapshot: Codable, Equatable, Sendable {
     public var bills: [BillSchedule] = []
     /// Topic id → name, for the "never mention" picker and journal topics.
     public var topics: [String: String] = [:]
+    /// Wellness check-ins from the last week: the numbers and choices only (never the notes).
+    public var wellness: [WellnessDay] = []
 
     public init(exportedAt: Date) { self.exportedAt = exportedAt }
 }

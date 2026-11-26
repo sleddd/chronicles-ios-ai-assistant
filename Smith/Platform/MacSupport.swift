@@ -95,21 +95,23 @@ final class WakeWatcher {
 
     func start(lastGreetingDay: @escaping () -> String?) {
         self.lastGreetingDay = lastGreetingDay
-        let center = NSWorkspace.shared.notificationCenter
-        let names: [Notification.Name] = [NSWorkspace.screensDidWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification]
-        for name in names {
-            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { _ in
-                MainActor.assumeIsolated { WakeWatcher.shared.check() }
-            })
-        }
+        // Only after the Mac is unlocked. The screen waking comes before anyone has
+        // signed in, and the briefing (doses, bills) must never be read out at the login screen.
         observers.append(DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { WakeWatcher.shared.check() }
         })
     }
 
+    /// The day already acted on here: the saved greeting day is only written once
+    /// the briefing has finished, and a second unlock notice can arrive before that.
+    private var handledDay: String?
+
     private func check() {
-        if lastGreetingDay?() != Self.todayKey(), Calendar.current.component(.hour, from: Date()) >= 4 { onFirstWakeOfDay?() }
+        let today = Self.todayKey()
+        guard handledDay != today, lastGreetingDay?() != today, Calendar.current.component(.hour, from: Date()) >= 4 else { return }
+        handledDay = today
+        onFirstWakeOfDay?()
     }
 
     static func todayKey() -> String {
@@ -144,7 +146,10 @@ final class WakeWordListener {
 
     func stop() {
         isRunning = false
+        round += 1
         restartTimer?.invalidate()
+        // Stopped just after the phrase was heard: nothing is handed over a moment later
+        waitAfterWake?.invalidate(); waitAfterWake = nil
         task?.cancel(); task = nil
         request?.endAudio(); request = nil
         if engine.isRunning { engine.stop() }
@@ -154,17 +159,36 @@ final class WakeWordListener {
     func pause(hours: Double = 1) {
         pausedUntil = Date().addingTimeInterval(hours * 3600)
         stop()
-        Timer.scheduledTimer(withTimeInterval: hours * 3600, repeats: false) { _ in Task { @MainActor in WakeWordListener.shared.start() } }
+        pauseTimer?.invalidate()
+        pauseTimer = Timer.scheduledTimer(withTimeInterval: hours * 3600, repeats: false) { _ in
+            Task { @MainActor in
+                // Switched off in Settings meanwhile: it stays off
+                guard AppModel.shared.store.settings.macWakeWord else { return }
+                WakeWordListener.shared.start()
+            }
+        }
     }
+
+    private var pauseTimer: Timer?
+
+    /// Which recognition request is the current one. A cancelled request still reports
+    /// (as a failure); acting on that would cancel its replacement, whose failure would
+    /// cancel the next, restarting the microphone over and over.
+    private var round = 0
 
     private func begin() {
         guard isRunning, let recognizer else { return }
+        round += 1
+        let mine = round
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.requiresOnDeviceRecognition = true
         req.shouldReportPartialResults = true
         req.contextualStrings = ["Hey Smith", "Smith"]
         request = req
         let input = engine.inputNode
+        let inputFormat = input.outputFormat(forBus: 0)
+        // No microphone: a tap with an empty format would stop the app
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else { isRunning = false; return }
         input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 2048, format: input.outputFormat(forBus: 0), block: VoiceIO.tap(req) { @Sendable _ in })
         engine.prepare()
@@ -172,7 +196,7 @@ final class WakeWordListener {
         fired = false
         task = recognizer.recognitionTask(with: req, resultHandler: VoiceIO.results { @Sendable [weak self] transcript, _, failed in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.round == mine, self.isRunning else { return }
                 if let text = transcript?.lowercased(),
                    let r = text.range(of: "hey smith", options: .backwards) ?? text.range(of: "hi smith", options: .backwards) {
                     let after = String(text[r.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
@@ -186,17 +210,26 @@ final class WakeWordListener {
                         }
                     }
                 }
-                if failed && !self.fired { self.recycle() }
+                if failed && !self.fired {
+                    // A real failure: start again after a breath, not in a tight loop
+                    self.round += 1
+                    try? await Task.sleep(for: .seconds(1))
+                    if self.round == mine + 1, self.isRunning { self.recycle() }
+                }
             }
         })
         // Recycle the recognizer regularly so it doesn't build up a long transcript.
         restartTimer?.invalidate()
         restartTimer = Timer.scheduledTimer(withTimeInterval: 45, repeats: false) { _ in
-            Task { @MainActor in if !WakeWordListener.shared.fired { WakeWordListener.shared.recycle() } }
+            Task { @MainActor in
+                let me = WakeWordListener.shared
+                if me.round == mine, !me.fired { me.recycle() }
+            }
         }
     }
 
     private func recycle() {
+        round += 1   // whatever the old request still reports is ignored
         task?.cancel(); task = nil
         request?.endAudio(); request = nil
         if engine.isRunning { engine.stop() }

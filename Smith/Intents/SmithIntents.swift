@@ -10,13 +10,16 @@ struct GoodMorningIntent: AppIntent {
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let app = AppModel.shared
-        await app.weather.refresh(fahrenheit: app.store.settings.fahrenheit)
+        app.chronicles.checkAutoLock()
+        let unlocked = app.chronicles.isUnlocked
+        if unlocked { await app.weather.refresh(fahrenheit: app.store.settings.fahrenheit) }
         let goal = app.store.settings.goalMentionInBriefing ? ", plus a plain mention of a goal in progress" : ""
         let text = await app.brain.oneShot("""
             [Morning briefing, read aloud by Siri] Greet them warmly, then the time, the weather, today's events and \
             planned tasks, deadlines, bills due soon, medication doses and their top priority\(goal). Keep it short.
             """)
-        app.store.updateLocalSettings { $0.lastGreetingDay = Day.key() }
+        // Only a real briefing counts as the day's greeting
+        if unlocked { app.store.updateLocalSettings { $0.lastGreetingDay = Day.key() } }
         return .result(dialog: IntentDialog(stringLiteral: text))
     }
 }

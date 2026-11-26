@@ -9,6 +9,7 @@ struct SettingsView: View {
     @State private var exportingBackup: SmithDataDocument?
     @State private var pairCode = ""
     @State private var confirmErase = false
+    @State private var newBanned = ""
     @State private var confirmChroniclesReset = false
     @State private var newSample = ""
     @State private var elevenKey = ""
@@ -50,11 +51,15 @@ struct SettingsView: View {
                         Text("2 seconds").tag(2.0); Text("3 seconds").tag(3.0); Text("5 seconds").tag(5.0); Text("Until I tap").tag(0.0)
                     }
                     Caps("Tap the orb anytime to say you're done.", size: 8, color: Theme.faint)
+                    Toggle("Mute Smith (text only)", isOn: Binding(get: { s.muted }, set: { v in store.updateSettings { $0.muted = v }; if v { app.voice.stopSpeaking() } }))
                     Toggle("Speak replies to typed messages", isOn: binding(\.speakTypedReplies))
                     Toggle("Mention a goal in the morning briefing", isOn: binding(\.goalMentionInBriefing))
                     Toggle("Temperatures in °F", isOn: Binding(get: { s.fahrenheit }, set: { v in store.updateSettings { $0.fahrenheit = v }; app.applyVoiceSettings() }))
                     Caps("Voices: download Enhanced or Premium voices in System Settings → Accessibility → Spoken Content.", size: 8, color: Theme.faint)
                 }
+
+                SectionLabel("Words Smith never uses")
+                GlassCard { bannedCard }
 
                 SectionLabel("Weather")
                 GlassCard { weatherCard }
@@ -137,9 +142,43 @@ struct SettingsView: View {
             Text("Smith signs out of Chronicles and deletes your tasks, events, goals, habits, bill dates and journal summaries from this device. What Smith knows about you, conversation summaries, letters and settings stay. Connect or import again to bring Chronicles back.")
         }
         .alert("Erase everything?", isPresented: $confirmErase) {
-            Button("Erase", role: .destructive) { store.eraseAll(); app.brain.refreshHeadline() }
+            Button("Erase", role: .destructive) {
+                // Signed out first, so nothing is synced back onto the device just erased
+                app.chronicles.disconnect()
+                app.startOver()
+                store.eraseAll()
+                app.brain.refreshHeadline()
+            }
             Button("Cancel", role: .cancel) {}
         } message: { Text("Deletes Smith's data on this device: Chronicles data, journal summaries, what Smith knows about you, conversation summaries, letters and settings.") }
+    }
+
+    @ViewBuilder private var bannedCard: some View {
+        let custom = app.store.settings.customBannedPhrases
+        Text("Add any word or phrase you never want to hear from Smith, in chat or in letters. It's added to the built-in list (things like \"I'm proud of you\" and \"haha\").")
+            .font(Theme.rounded(13)).foregroundStyle(Theme.dim).fixedSize(horizontal: false, vertical: true)
+        if !custom.isEmpty {
+            FlowChips(items: custom) { phrase in
+                app.store.updateSettings { $0.customBannedPhrases.removeAll { $0 == phrase } }
+            }
+        }
+        HStack(spacing: 12) {
+            TextField("", text: $newBanned, prompt: Text("Add a word or phrase").foregroundStyle(Theme.faint))
+                .textFieldStyle(.plain).focusEffectDisabled().onSubmit(addBanned)
+                .padding(.horizontal, 14).frame(height: 36)
+                .background(Color.black.opacity(0.4), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            Button("Add", action: addBanned).buttonStyle(.plain).foregroundStyle(Theme.teal)
+                .disabled(newBanned.trimmingCharacters(in: .whitespaces).isEmpty)
+        }
+    }
+
+    private func addBanned() {
+        let p = newBanned.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !p.isEmpty else { return }
+        app.store.updateSettings { s in
+            if !s.customBannedPhrases.contains(where: { $0.caseInsensitiveCompare(p) == .orderedSame }) { s.customBannedPhrases.append(p) }
+        }
+        newBanned = ""
     }
 
     @ViewBuilder private var weatherCard: some View {
@@ -439,4 +478,48 @@ nonisolated struct SmithDataDocument: FileDocument {
     init(data: Data) { self.data = data }
     init(configuration: ReadConfiguration) throws { data = configuration.file.regularFileContents ?? Data() }
     func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper { FileWrapper(regularFileWithContents: data) }
+}
+
+/// Phrases as removable chips that wrap onto new lines.
+struct FlowChips: View {
+    let items: [String]
+    let remove: (String) -> Void
+    var body: some View {
+        FlowLayout(spacing: 8) {
+            ForEach(items, id: \.self) { item in
+                HStack(spacing: 6) {
+                    Text(item).font(Theme.rounded(13)).foregroundStyle(Theme.text)
+                    Button { remove(item) } label: { Image(systemName: "xmark").font(.system(size: 10, weight: .semibold)) }
+                        .buttonStyle(.plain).foregroundStyle(Theme.dim).help("Remove")
+                }
+                .padding(.horizontal, 12).frame(height: 30)
+                .background(Color.white.opacity(0.06), in: Capsule())
+                .overlay(Capsule().stroke(.white.opacity(0.1)))
+            }
+        }
+    }
+}
+
+/// Lays children out left to right, wrapping to a new line when the row is full.
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 8
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? .infinity
+        var x: CGFloat = 0, y: CGFloat = 0, rowH: CGFloat = 0, maxX: CGFloat = 0
+        for v in subviews {
+            let s = v.sizeThatFits(.unspecified)
+            if x > 0 && x + s.width > width { x = 0; y += rowH + spacing; rowH = 0 }
+            x += s.width + spacing; rowH = max(rowH, s.height); maxX = max(maxX, x - spacing)
+        }
+        return CGSize(width: proposal.width ?? maxX, height: y + rowH)
+    }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX, y = bounds.minY, rowH: CGFloat = 0
+        for v in subviews {
+            let s = v.sizeThatFits(.unspecified)
+            if x > bounds.minX && x + s.width > bounds.maxX { x = bounds.minX; y += rowH + spacing; rowH = 0 }
+            v.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(s))
+            x += s.width + spacing; rowH = max(rowH, s.height)
+        }
+    }
 }

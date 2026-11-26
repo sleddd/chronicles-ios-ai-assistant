@@ -3,14 +3,22 @@ import Foundation
 // Smith's own data lives in Chronicles as ordinary entries, end-to-end
 // encrypted like everything else, in three topics Smith creates:
 // "Smith memories" (what Smith knows, and the "don't learn" markers),
-// "Letters", and "Smith conversations" (summaries). Every device reads and
+// "Smith letters", and "Smith conversations" (summaries). Every device reads and
 // writes the same entries, so the Mac and the iPad always agree.
 // Entries Smith made carry `smithKind` and `smithId`; ones the person adds in
 // Chronicles themselves are read too (they're the person's to edit there).
 
 public enum SmithTopics {
     public static let memories = "Smith memories"
-    public static let letters = "Letters"
+    public static let letters = "Smith letters"
+    /// What the letters topic was first called. Too ordinary a name: a "Letters" topic
+    /// of the person's own would have been read as Smith's. Only entries Smith itself
+    /// made there (they carry `smithKind`) are still read, and they are moved across.
+    public static let legacyLetters = "Letters"
+
+    public static func isLegacyLetters(_ name: String?) -> Bool {
+        name?.trimmingCharacters(in: .whitespaces).lowercased() == legacyLetters.lowercased()
+    }
     public static let conversations = "Smith conversations"
     public static let all = [memories, letters, conversations]
 
@@ -167,7 +175,11 @@ public struct RemoteSmithRecord: Equatable, Sendable {
     public var record: SmithRecord
     /// Made by Smith (so Smith may edit or delete it); otherwise the person's own.
     public var owned: Bool
-    public init(entryID: Int, record: SmithRecord, owned: Bool) { self.entryID = entryID; self.record = record; self.owned = owned }
+    /// One of Smith's letters still in the old "Letters" topic, to be moved to "Smith letters".
+    public var misplaced = false
+    public init(entryID: Int, record: SmithRecord, owned: Bool, misplaced: Bool = false) {
+        self.entryID = entryID; self.record = record; self.owned = owned; self.misplaced = misplaced
+    }
 }
 
 /// Works out, from what's in Chronicles, what's on this device, and what both
@@ -191,6 +203,8 @@ public enum SmithMerge {
 
     /// `base`: each record's fingerprint at the last sync. Chronicles wins a
     /// conflict (both changed), so nothing is ever lost silently on its side.
+    /// Entries the person wrote in Chronicles themselves are treated the same as
+    /// Smith's: what they change or delete in Smith is sent, not quietly put back.
     public static func plan(remote: [RemoteSmithRecord], local: [SmithRecord], base: [UUID: String]) -> Plan {
         var plan = Plan()
         let r = Dictionary(remote.map { ($0.record.id, $0) }, uniquingKeysWith: { a, _ in a })
@@ -202,18 +216,18 @@ public enum SmithMerge {
             let rem = r[id], loc = l[id], was = base[id]
             switch (rem, loc) {
             case (let rem?, let loc?):
-                if loc.fingerprint == rem.record.fingerprint || loc.fingerprint == was || !rem.owned {
-                    plan.keep.append(rem.record)                  // same, or only Chronicles changed, or theirs
+                if loc.fingerprint == rem.record.fingerprint || loc.fingerprint == was || was == nil {
+                    plan.keep.append(rem.record)                  // same, only Chronicles changed, or never agreed on
                 } else if rem.record.fingerprint == was {
                     plan.keep.append(loc); plan.update.append((rem.entryID, loc))   // only this device changed
                 } else {
                     plan.keep.append(rem.record)                  // both changed: Chronicles wins
                 }
             case (let rem?, nil):
-                if was != nil && rem.owned {
+                if was != nil {
                     plan.delete.append(rem.entryID)               // deleted here
                 } else {
-                    plan.keep.append(rem.record)                  // new from elsewhere (or the person's own)
+                    plan.keep.append(rem.record)                  // new from elsewhere
                 }
             case (nil, let loc?):
                 if was == nil { plan.keep.append(loc); plan.create.append(loc) }   // new here

@@ -61,13 +61,39 @@ import Testing
         p = SmithMerge.plan(remote: [.init(entryID: 3, record: c, owned: true)], local: [], base: [:])
         #expect(p.keep == [c] && p.create.isEmpty)
 
-        // Both changed → Chronicles wins; the person's own entries are never changed or deleted by Smith
+        // Both changed → Chronicles wins. The person's own entries follow the same rules:
+        // what they edit or delete in Smith is sent, not put back
         let aOther: SmithRecord = { if case .fact(var f) = a { f.text = "A3"; return .fact(f) }; return a }()
         p = SmithMerge.plan(remote: [.init(entryID: 1, record: aOther, owned: true)], local: [aEdited], base: [a.id: a.fingerprint])
         #expect(p.keep == [aOther] && p.update.isEmpty)
         p = SmithMerge.plan(remote: [.init(entryID: 4, record: a, owned: false)], local: [aEdited], base: [a.id: a.fingerprint])
-        #expect(p.keep == [a] && p.update.isEmpty)
+        #expect(p.keep == [aEdited] && p.update.map(\.entryID) == [4])
         p = SmithMerge.plan(remote: [.init(entryID: 4, record: a, owned: false)], local: [], base: [a.id: a.fingerprint])
-        #expect(p.delete.isEmpty && p.keep == [a])
+        #expect(p.delete == [4] && p.keep.isEmpty)
+        // Never agreed on (first sight of it): Chronicles' copy is taken, nothing is sent
+        p = SmithMerge.plan(remote: [.init(entryID: 4, record: a, owned: false)], local: [aEdited], base: [:])
+        #expect(p.keep == [a] && p.update.isEmpty && p.delete.isEmpty)
+        // The topic of Smith's own is "Smith letters"; a plain "Letters" topic is the person's
+        #expect(SmithTopics.which("Letters") == nil && SmithTopics.which("smith letters") == SmithTopics.letters)
+    }
+}
+
+@Suite struct WellnessTests {
+    @Test func theCardsNumbersAreReadButNeverItsNotes() throws {
+        var root = try JSONSerialization.jsonObject(with: Fixture.exportData) as! [String: Any]
+        var entries = root["entries"] as! [[String: Any]]
+        for i in entries.indices where "\(entries[i]["id"]!)" == "901" {
+            entries[i]["metadata"] = ["_widgetType": "wellness-checkin",
+                                      "_customFields": ["date": Fixture.today, "moodScore": 4, "sleepHours": 7.5, "waterGlasses": 3,
+                                                        "stress": 2, "eating": "just_right", "notes": "CANARY-WELLNESS-6RR"]]
+        }
+        root["entries"] = entries
+        let r = try ExportParser.parse(try JSONSerialization.data(withJSONObject: root), now: Fixture.now)
+        let w = try #require(r.snapshot.wellness.first { $0.date == Fixture.today })
+        #expect(w.entryID == "901" && w.mood == 4 && w.water == 3)
+        #expect(w.line.contains("mood Good") && w.line.contains("slept 7.5h") && w.line.contains("water 3 of 8") && w.line.contains("stress Low"))
+        let saved = String(data: try JSONEncoder().encode(r.snapshot), encoding: .utf8)!
+        #expect(!saved.contains("CANARY-WELLNESS-6RR"))
+        #expect(!r.journal.contains { $0.text.contains("CANARY-WELLNESS-6RR") })
     }
 }

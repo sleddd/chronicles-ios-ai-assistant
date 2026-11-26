@@ -88,14 +88,38 @@ nonisolated enum Keychain {
         set { set(newValue.flatMap { $0.isEmpty ? nil : Data($0.utf8) }, for: "anthropic-api-key") }
     }
 
-    /// The key that encrypts Smith's files. Made once per device.
-    static var storageKey: SymmetricKey {
-        if let k = cachedStorageKey { return k }
-        if let d = data("storage-key") { cachedStorageKey = SymmetricKey(data: d); return cachedStorageKey! }
-        let k = SymmetricKey(size: .bits256)
-        if set(k.withUnsafeBytes { Data($0) }, for: "storage-key") { cachedStorageKey = k }
-        return k
+    /// Whether a secret was ever saved under this name, readable right now or not.
+    static func exists(_ account: String) -> Bool {
+        if SecureEnclaveVault.exists("secret-\(account).se") { return true }
+        for dp in [true, false] {
+            // Found, or there but not readable now (the device is locked): both mean it exists
+            let status = SecItemCopyMatching(query(account, dataProtection: dp) as CFDictionary, nil)
+            if status == errSecSuccess || status == errSecInteractionNotAllowed { return true }
+        }
+        return false
     }
+
+    /// The key that encrypts Smith's files. Made once per device.
+    ///
+    /// nil when a key was saved but can't be read right now (Smith started while the
+    /// device was locked, say). A new key is only ever made when none was saved:
+    /// making one because a read failed would leave every file unreadable for good.
+    static var storageKey: SymmetricKey? {
+        storageKeyLock.withLock {
+            if let k = cachedStorageKey { return k }
+            if let d = data("storage-key"), d.count == 32 {
+                cachedStorageKey = SymmetricKey(data: d)
+                return cachedStorageKey
+            }
+            guard !exists("storage-key") else { return nil }
+            let k = SymmetricKey(size: .bits256)
+            // Not saved: not used, or the next launch couldn't open what this one wrote
+            guard set(k.withUnsafeBytes { Data($0) }, for: "storage-key") else { return nil }
+            cachedStorageKey = k
+            return k
+        }
+    }
+    private static let storageKeyLock = NSLock()
     nonisolated(unsafe) private static var cachedStorageKey: SymmetricKey?
 
     static var syncKey: SymmetricKey? {
@@ -129,21 +153,39 @@ nonisolated enum EncryptedFile {
 
     static func raw(_ name: String) -> Data? {
         let url = folder.appendingPathComponent(name)
-        guard let sealed = try? Data(contentsOf: url),
+        guard let key = Keychain.storageKey, let sealed = try? Data(contentsOf: url),
               let box = try? AES.GCM.SealedBox(combined: sealed),
-              let plain = try? AES.GCM.open(box, using: Keychain.storageKey) else { return nil }
+              let plain = try? AES.GCM.open(box, using: key) else { return nil }
         return plain
     }
 
-    static func write<T: Encodable>(_ value: T, _ name: String) {
-        guard let plain = try? JSONEncoder().encode(value),
-              let sealed = try? AES.GCM.seal(plain, using: Keychain.storageKey).combined else { return }
-        let url = folder.appendingPathComponent(name)
-        #if os(iOS)
-        try? sealed.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-        #else
-        try? sealed.write(to: url, options: .atomic)
-        #endif
+    /// False while the storage key can't be read: nothing can be opened, and nothing may be saved.
+    static var isAvailable: Bool { Keychain.storageKey != nil }
+
+    static func exists(_ name: String) -> Bool {
+        FileManager.default.fileExists(atPath: folder.appendingPathComponent(name).path)
+    }
+
+    /// The last save that didn't reach the disk, for Settings to show.
+    nonisolated(unsafe) static var lastWriteError: String?
+
+    @discardableResult
+    static func write<T: Encodable>(_ value: T, _ name: String) -> Bool {
+        guard let key = Keychain.storageKey else { lastWriteError = "Smith’s storage key can’t be read right now."; return false }
+        do {
+            let plain = try JSONEncoder().encode(value)
+            guard let sealed = try AES.GCM.seal(plain, using: key).combined else { return false }
+            let url = folder.appendingPathComponent(name)
+            #if os(iOS)
+            try sealed.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            #else
+            try sealed.write(to: url, options: .atomic)
+            #endif
+            return true
+        } catch {
+            lastWriteError = "Couldn’t save \(name): \(error.localizedDescription)"
+            return false
+        }
     }
 
     static func delete(_ name: String) {

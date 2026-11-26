@@ -29,7 +29,6 @@ targets:
       properties:
         com.apple.security.app-sandbox: true
         com.apple.security.network.client: true
-        com.apple.security.network.server: true
         com.apple.security.files.user-selected.read-write: true
         com.apple.security.device.audio-input: true
         com.apple.security.personal-information.location: true
@@ -39,11 +38,10 @@ targets:
         CFBundleDisplayName: Smith
         LSApplicationCategoryType: public.app-category.productivity
         NSMicrophoneUsageDescription: Smith listens when you tap the orb or say "Hey Smith".
+        NSFaceIDUsageDescription: Face ID unlocks Smith without typing your Chronicles password each time.
         NSSpeechRecognitionUsageDescription: Your speech is turned into text on this device so Smith can answer.
         NSLocationWhenInUseUsageDescription: Smith uses your approximate location for the weather.
         NSLocationUsageDescription: Smith uses your approximate location for the weather.
-        NSLocalNetworkUsageDescription: Smith syncs directly between your Mac and iPad on your own network.
-        NSBonjourServices: [_smithsync._tcp]
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
         UISupportedInterfaceOrientations~ipad:

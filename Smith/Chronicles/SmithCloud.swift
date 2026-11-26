@@ -35,7 +35,9 @@ final class SmithCloud {
     init(store: SmithStore, writer: @escaping () -> ChroniclesWriter?, account: @escaping () -> String?) {
         self.store = store; self.writer = writer; self.account = account
         state = EncryptedFile.read(State.self, Self.file) ?? State()
+        stateLoaded = EncryptedFile.isAvailable
         store.onSmithDataChanged = { [weak self] in self?.changedHere() }
+        store.onErased = { [weak self] in self?.erased() }
     }
 
     /// A change here: send it shortly (a few quick edits go together).
@@ -53,6 +55,16 @@ final class SmithCloud {
         await reconcile(remote: remote, topics: topics)
     }
 
+    private var stateLoaded = false
+
+    /// "Erase everything on this device": forget what was agreed with Chronicles.
+    /// Kept, it would read the now-empty device as "everything was deleted here"
+    /// and delete every memory and letter from Chronicles at the next sign-in.
+    private func erased() {
+        pending?.cancel(); pending = nil
+        state = State(); lastRemote = []; topicIDs = [:]
+    }
+
     func signedOut() {
         lastRemote = []; topicIDs = [:]
         pending?.cancel(); pending = nil
@@ -64,8 +76,17 @@ final class SmithCloud {
         running = true
         defer { running = false }
 
+        // Nothing is compared, sent or deleted until this device's own copy is really loaded
+        guard store.loaded else { return }
+        if !stateLoaded {
+            state = EncryptedFile.read(State.self, Self.file) ?? State()
+            stateLoaded = true
+        }
         // Another account on this device: start its agreement afresh
         if state.account != account { state = State(account: account) }
+        // This device's records couldn't be opened: "missing here" must not be read as
+        // "deleted here". With no agreement, Chronicles' copy is simply taken.
+        if store.smithRecordsUnreadable { state.base = [:] }
         topicIDs = topics
         lastRemote = remote
 
@@ -73,6 +94,14 @@ final class SmithCloud {
         var entryOf = Dictionary(remote.map { ($0.record.id, $0.entryID) }, uniquingKeysWith: { a, _ in a })
         var base = Dictionary(remote.map { ($0.record.id, $0.record.fingerprint) }, uniquingKeysWith: { a, _ in a })
         var problem: String?
+        var keep = plan.keep
+        let remoteByEntry = Dictionary(remote.map { ($0.entryID, $0) }, uniquingKeysWith: { a, _ in a })
+        // Chronicles wouldn't take a change to one of the person's own entries: its copy
+        // comes back here (so the two agree and it isn't tried for ever), and they're told
+        func putBack(_ r: RemoteSmithRecord) {
+            if let i = keep.firstIndex(where: { $0.id == r.record.id }) { keep[i] = r.record } else { keep.append(r.record) }
+            problem = "One you wrote in Chronicles can only be changed there, so it’s back as it was."
+        }
 
         // A topic is made the first time something needs to go in it
         func topicID(for record: SmithRecord) async -> Int? {
@@ -93,9 +122,12 @@ final class SmithCloud {
         }
         for (entryID, rec) in plan.update {
             guard let topic = await topicID(for: rec) else { continue }
+            let theirs = remoteByEntry[entryID]?.owned == false
             do {
-                try await writer.updateSmithRecord(entryID: entryID, rec, topicID: topic)
+                try await writer.updateSmithRecord(entryID: entryID, rec, topicID: topic, theirs: theirs)
                 base[rec.id] = rec.fingerprint
+            } catch ChroniclesError.refused where theirs {
+                if let r = remoteByEntry[entryID] { putBack(r) }
             } catch { problem = error.localizedDescription }   // base unchanged: tried again next time
         }
         let deleted = Set(plan.delete)
@@ -104,6 +136,9 @@ final class SmithCloud {
                 try await writer.deleteSmithRecord(entryID: entryID)
             } catch ChroniclesError.notFound {
                 // already gone
+            } catch ChroniclesError.refused where remoteByEntry[entryID]?.owned == false {
+                if let r = remoteByEntry[entryID] { putBack(r) }
+                continue
             } catch {
                 problem = error.localizedDescription
                 continue
@@ -115,13 +150,21 @@ final class SmithCloud {
             base[r.record.id] = state.base[r.record.id] ?? r.record.fingerprint
         }
 
-        store.applySmithRecords(plan.keep)
+        // Smith's letters still in the old "Letters" topic move to "Smith letters" (once each)
+        let touched = Set(plan.update.map(\.entryID)).union(deleted)
+        for r in remote where r.misplaced && r.owned && !touched.contains(r.entryID) {
+            guard let topic = await topicID(for: r.record) else { break }
+            do { try await writer.updateSmithRecord(entryID: r.entryID, r.record, topicID: topic) }
+            catch { problem = error.localizedDescription }   // still read where it is; tried again next time
+        }
+
+        store.applySmithRecords(keep)
         state.base = base.filter { entryOf[$0.key] != nil }
         state.remote = entryOf
         EncryptedFile.write(state, Self.file)
 
         // Chronicles as it now is, for the next change made here
-        lastRemote = plan.keep.compactMap { rec in
+        lastRemote = keep.compactMap { rec in
             entryOf[rec.id].map { RemoteSmithRecord(entryID: $0, record: rec, owned: remote.first { $0.record.id == rec.id }?.owned ?? true) }
         }
         lastProblem = problem

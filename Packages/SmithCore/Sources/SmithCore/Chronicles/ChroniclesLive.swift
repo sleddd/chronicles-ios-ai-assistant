@@ -22,9 +22,25 @@ public protocol ChroniclesTransport: Sendable {
 public struct URLSessionChroniclesTransport: ChroniclesTransport {
     public let baseURL: URL
     let session: URLSession
-    public init(baseURL: URL, session: URLSession = .shared) { self.baseURL = baseURL; self.session = session }
+    public init(baseURL: URL, session: URLSession = URLSessionChroniclesTransport.privateSession) { self.baseURL = baseURL; self.session = session }
+
+    /// No cache, no cookies, no saved credentials: the shared session would keep
+    /// answers (and the requests' Authorization headers) in a cache file on disk.
+    public static let privateSession: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.urlCache = nil
+        c.requestCachePolicy = .reloadIgnoringLocalCacheData
+        c.httpCookieStorage = nil
+        c.httpShouldSetCookies = false
+        c.urlCredentialStorage = nil
+        return URLSession(configuration: c)
+    }()
 
     public func send(method: String, path: String, body: JSONValue?, token: String?) async throws -> HTTPResponse {
+        try await send(method: method, path: path, body: body, token: token, retriesLeft: 2)
+    }
+
+    private func send(method: String, path: String, body: JSONValue?, token: String?, retriesLeft: Int) async throws -> HTTPResponse {
         guard let url = URL(string: path, relativeTo: baseURL) else { throw ChroniclesError.badURL }
         var req = URLRequest(url: url)
         req.httpMethod = method
@@ -39,9 +55,11 @@ public struct URLSessionChroniclesTransport: ChroniclesTransport {
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         let json = data.isEmpty ? JSONValue.null : ((try? JSONValue.parse(data)) ?? .string(String(data: data, encoding: .utf8) ?? ""))
         if status == 429, let retry = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "retry-after"),
-           let secs = Double(retry), secs <= 5 {
-            try await Task.sleep(for: .seconds(secs))
-            return try await send(method: method, path: path, body: body, token: token)
+           let secs = Double(retry), secs.isFinite, secs <= 5, retriesLeft > 0 {
+            // A short wait at least, and only a couple of tries: a server that keeps
+            // answering "retry after 0" must not keep this going for ever
+            try await Task.sleep(for: .seconds(max(0.5, secs)))
+            return try await send(method: method, path: path, body: body, token: token, retriesLeft: retriesLeft - 1)
         }
         return HTTPResponse(status: status, body: json)
     }
@@ -260,7 +278,9 @@ extension ChroniclesClient {
             guard let key = row["key"]?.string, let value = row["value"] else { continue }
             if value["ciphertext"] != nil, value["iv"] != nil {
                 if let opened = try? ChroniclesCrypto.openSetting(key: key, sealed: value, keys: s.keys) { out[key] = opened }
-            } else if key != Self.sealedPrivacyKey {
+            } else if key != Self.sealedPrivacyKey, key != "aiConfig" {
+                // (The AI key setting too: a readable one would be the server choosing
+                // which Anthropic key Smith's requests go out under.)
                 // The sealed "Don't share with AI" choices are never taken readable:
                 // a readable value there would be the server's own, passed off as
                 // the copy only the account's key can write
@@ -394,7 +414,7 @@ public actor ChroniclesLiveSync {
     /// First load or after a reset: everything. Later: just what changed.
     public func refresh(now: Date = Date()) async throws -> Result {
         let topics = try await client.topics(session)
-        topicNames = Dictionary(uniqueKeysWithValues: topics.map { ($0.id, $0.name) })
+        topicNames = Dictionary(topics.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
         // First, so every entry taken below is checked against the account's choices
         var settings = try await client.settings(session)
         let kept = Self.keptFromAI(settings)
@@ -492,13 +512,18 @@ public actor ChroniclesLiveSync {
                             homePlace: HomePlace(settings["dashboardConfig"]?["places"]?.array?.first))
         // Smith's own topics and what's in them (newest first)
         for (id, name) in topicNames { if let t = SmithTopics.which(name) { result.smithTopicIDs[t] = id } }
-        let smithTopic = Dictionary(uniqueKeysWithValues: result.smithTopicIDs.map { ($0.value, $0.key) })
+        let smithTopic = Dictionary(result.smithTopicIDs.map { ($0.value, $0.key) }, uniquingKeysWith: { a, _ in a })
+        let legacyLetters = Set(topicNames.filter { SmithTopics.isLegacyLetters($0.value) }.keys)
         result.smithRecords = entries.values.compactMap { e -> (Date, RemoteSmithRecord)? in
-            guard let t = e.metadata["_taxonomyId"]?.int, let topic = smithTopic[t] else { return nil }
+            guard let t = e.metadata["_taxonomyId"]?.int else { return nil }
+            // In the old "Letters" topic only what Smith itself made is Smith's; the rest is the person's own
+            let misplaced = smithTopic[t] == nil && legacyLetters.contains(t)
+                && e.metadata["_customFields"]?["smithKind"]?.string == "letter"
+            guard let topic = smithTopic[t] ?? (misplaced ? SmithTopics.letters : nil) else { return nil }
             let updated = SmithRecord.date(.string(e.updatedAt)) ?? SmithRecord.date(.string(e.createdAt)) ?? .distantPast
             guard let rec = SmithRecord.from(content: e.content, metadata: e.metadata, topic: topic, entryID: e.id, updatedAt: updated) else { return nil }
             let owned = e.metadata["_customFields"]?["smithKind"]?.string != nil
-            return (updated, RemoteSmithRecord(entryID: e.id, record: rec, owned: owned))
+            return (updated, RemoteSmithRecord(entryID: e.id, record: rec, owned: owned, misplaced: misplaced))
         }.sorted { $0.0 > $1.0 }.map(\.1)
         return result
     }
@@ -509,6 +534,22 @@ public actor ChroniclesLiveSync {
         guard let cfg, cfg["enabled"]?.bool == true, (cfg["provider"]?.string ?? "anthropic") == "anthropic",
               let key = cfg["apiKey"]?.string?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else { return nil }
         return key
+    }
+
+    /// Whether Chronicles has entry changes since the last refresh: one light
+    /// request, nothing opened or kept (the refresh itself takes them).
+    public func hasChanges() async -> Bool {
+        guard let c = cursor else { return true }
+        guard let r = try? await client.call("GET", "/api/entries/changes?since=\(c)", nil, session) else { return false }
+        if r.body["reset"]?.bool == true { return true }
+        return !(r.body["entries"]?.array ?? []).isEmpty || !(r.body["deleted"]?.array ?? []).isEmpty
+    }
+
+    /// The entry id of the wellness check-in for a day, if there is one.
+    public func wellnessEntryID(day: String) -> Int? {
+        entries.values.first { e in
+            e.metadata["_widgetType"]?.string == "wellness-checkin" && e.metadata["_customFields"]?["date"]?.string == day
+        }?.id
     }
 
     /// The decrypted entry, for writes (always fetched fresh).

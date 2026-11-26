@@ -67,8 +67,13 @@ public enum ExportParser {
             let content = e["content"]?.string ?? ""
             let widget = meta["_widgetType"]?.string
 
-            // Saved chats and wellness check-ins aren't used at all.
-            if widget == "saved-chat" || widget == "wellness-checkin" { continue }
+            // Saved chats aren't used at all. Wellness check-ins: the last week's
+            // numbers and choices (the wellness card), never their notes.
+            if widget == "saved-chat" { continue }
+            if widget == "wellness-checkin" {
+                if let w = WellnessDay(entryID: id, fields: cf), w.date >= Day.addDays(Day.key(for: now), -7) { snap.wellness.append(w) }
+                continue
+            }
 
             switch kind(of: topicName) {
             case "task":
@@ -206,14 +211,15 @@ public enum ExportParser {
         ]
         if let k = map[n] { return k }
         // Smith's own topics (memories, letters, summaries): not journal, not plan data
-        if SmithTopics.which(n) != nil { return "smith" }
+        // (The old "Letters" name too: never summarized as journal, whoever wrote in it)
+        if SmithTopics.which(n) != nil || SmithTopics.isLegacyLetters(n) { return "smith" }
         if n.contains("time track") || n.hasPrefix("timesheet") || n == "time log" || n == "time tracker" { return "time_tracking" }
         return nil
     }
 
     static func idString(_ v: JSONValue?) -> String? {
         switch v {
-        case .number(let n)?: return String(Int64(n))
+        case .number(let n)?: return Int64(exactly: n.rounded(.towardZero)).map { String($0) }
         case .string(let s)? where !s.isEmpty: return s
         default: return nil
         }

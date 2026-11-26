@@ -17,6 +17,7 @@ struct LettersView: View {
     /// Lines revealed so far; they fade in one by one up to here.
     @State private var revealTo = 0
     @State private var writing = false
+    @State private var writingTask: Task<Void, Never>?
     /// The voice is loading: the letter appears once its first words are heard.
     @State private var waitingForVoice = false
     @State private var hearing = false
@@ -104,7 +105,7 @@ struct LettersView: View {
             }
         }
         .foregroundStyle(Theme.text)
-        .onDisappear { app.voice.stopSpeaking() }
+        .onDisappear { writingTask?.cancel(); app.voice.stopSpeaking() }
     }
 
     private func loading(_ text: String) -> some View {
@@ -140,11 +141,14 @@ struct LettersView: View {
     private func receive() {
         writing = true; error = nil
         app.voice.stopSpeaking()
-        Task {
+        writingTask?.cancel()
+        writingTask = Task {
             defer { writing = false }
             do {
                 let written = try await HenryWriter.write(store: app.store, message: message)
                 let text = written.text
+                // Left the page (or Smith locked) while it was being written: it's kept, not read out
+                let stillHere = !Task.isCancelled && app.chronicles.isUnlocked
                 risk = written.risk.isRisk ? written.risk : nil
                 // Every exchange is kept: what you wrote, and the letter back
                 let saved = Letter(yourMessage: message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : message, text: text)
@@ -152,7 +156,7 @@ struct LettersView: View {
                 savedID = saved.id
                 shownLines = 0; revealTo = 0
                 letter = text
-                readAloud(text)
+                if stillHere { readAloud(text) }
             } catch { self.error = error.localizedDescription }
         }
     }

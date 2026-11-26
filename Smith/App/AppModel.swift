@@ -12,7 +12,6 @@ final class AppModel {
     let voice: VoiceIO
     let weather: WeatherService
     let brain: SmithBrain
-    let sync: SyncService
     let chronicles: ChroniclesConnection
     let safety: SafetyCenter
 
@@ -51,7 +50,6 @@ final class AppModel {
         chronicles = ChroniclesConnection(store: store)
         safety = SafetyCenter(chronicles: chronicles)
         brain = SmithBrain(store: store, voice: voice, weather: weather, chronicles: chronicles, safety: safety)
-        sync = SyncService(store: store)
         // The old built-in "Henry" becomes the assistant's own name (a name you chose stays)
         if !store.settings.lettersRenamed {
             store.updateSettings { s in
@@ -67,6 +65,10 @@ final class AppModel {
             }
         }
         applyVoiceSettings()
+        store.onLoaded = { [unowned self] in
+            self.chronicles.storeLoaded()
+            self.applyVoiceSettings()
+        }
         weather.placeProvider = { [unowned self] in self.weatherPlace }
     }
 
@@ -106,6 +108,8 @@ final class AppModel {
 
     /// On launch and whenever the app comes forward.
     func becameActive() async {
+        // Started while the device was locked (Siri, say): the files can be read now
+        store.loadIfNeeded()
         brain.refreshHeadline()
         // (Mac ↔ iPad now share memories and letters through Chronicles; the local-network sync is retired)
         chronicles.checkAutoLock()
@@ -133,15 +137,34 @@ final class AppModel {
     func listenOnce() {
         guard chronicles.isUnlocked else { return }
         Task {
-            guard await voice.requestPermissions() else { importMessage = voice.permissionProblem; return }
+            guard await voice.requestPermissions() else { dictateIntoBox = false; importMessage = voice.permissionProblem; return }
             voice.listen { [weak self] text in
                 Task { @MainActor in await self?.heard(text) }
             }
+            // Didn't start (no microphone, no on-device recognition): say why, and don't
+            // leave the next thing they say headed for the typing box
+            if voice.state != .listening { dictateIntoBox = false; importMessage = voice.permissionProblem }
         }
+    }
+
+    /// Dictating into the typing box: what's said lands in the box to edit or add to, not sent.
+    var dictateIntoBox = false
+
+    /// The typing box's microphone: talk into the box. While already listening, stop
+    /// and put the words in the box instead of sending them.
+    func dictateToBox() {
+        dictateIntoBox = true
+        if voice.state == .listening { voice.finishListening() } else { listenOnce() }
     }
 
     private func heard(_ text: String) async {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if dictateIntoBox {
+            dictateIntoBox = false
+            guard !t.isEmpty else { return }
+            draft = draft.trimmingCharacters(in: .whitespaces).isEmpty ? t : draft + " " + t
+            return
+        }
         guard !t.isEmpty else { brain.conversationMode = false; return }
         if Self.isGoodbye(t) {
             brain.conversationMode = false
@@ -158,8 +181,9 @@ final class AppModel {
 
     static func isGoodbye(_ t: String) -> Bool {
         let s = t.lowercased().trimmingCharacters(in: .punctuationCharacters.union(.whitespaces))
-        return ["that's all", "that is all", "that's all for now", "goodbye", "bye smith", "thanks, that's all", "thank you, that's all"].contains(s)
-            || s.hasSuffix("that's all")
+        // Only on its own: "I think that's all I ate today" mustn't end the conversation
+        return ["that's all", "that is all", "that's all for now", "goodbye", "bye smith", "goodbye smith",
+                "thanks, that's all", "thank you, that's all", "thanks smith, that's all", "ok, that's all", "okay, that's all"].contains(s)
     }
 
     func typed(_ text: String) {
@@ -171,6 +195,7 @@ final class AppModel {
     /// Esc / Stop: stop listening (nothing is sent), stop speaking, and stop an
     /// answer in progress — your message comes back to the typing box.
     func stopAll() {
+        dictateIntoBox = false
         if let taken = brain.stop() { draft = taken }
     }
 
@@ -225,6 +250,8 @@ final class AppModel {
     }
 
     func openURL(_ url: URL) {
+        // A file handed to Smith replaces what the briefing reads: only once it's unlocked
+        guard chronicles.isUnlocked else { importMessage = "Unlock Smith first, then open the file again."; return }
         if url.pathExtension == "smithdata" {
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }

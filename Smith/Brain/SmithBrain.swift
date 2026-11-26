@@ -3,7 +3,17 @@ import Observation
 import SmithCore
 
 /// The reply line being filled in, as each sentence's audio starts.
-final class ReplyLine { var id: UUID? }
+final class ReplyLine { var id: UUID?; var sent: SentInfo? }
+
+/// What went to Claude for one reply, shown under it ("What was sent").
+struct SentInfo: Equatable {
+    struct Part: Equatable, Identifiable {
+        let id = UUID()
+        var title: String
+        var text: String
+    }
+    var parts: [Part] = []
+}
 
 /// One line in the chat.
 struct ChatLine: Identifiable, Equatable {
@@ -13,6 +23,8 @@ struct ChatLine: Identifiable, Equatable {
     var text: String
     /// For `.resources`: which helplines come first.
     var kind: RiskKind? = nil
+    /// For Smith's replies: what was sent to Claude to write it.
+    var sent: SentInfo? = nil
 }
 
 /// The live conversation. It exists only in memory; when it ends, Smith keeps
@@ -70,6 +82,19 @@ final class SmithBrain {
         return ctx
     }
 
+    /// The day's overview for the screen. Building the whole context (concerns, the
+    /// journal digest, what Smith knows) is slow, and the home screen redraws many
+    /// times a second while the microphone level moves: so one result is kept for a
+    /// few seconds, and made again when the Chronicles data changes.
+    func overviewForDisplay() -> DayOverview? {
+        let stamp = store.snapshot?.exportedAt
+        if let c = overviewCache, c.snapshot == stamp, Date().timeIntervalSince(c.at) < 15 { return c.value }
+        let value = context().overview
+        overviewCache = (Date(), stamp, value)
+        return value
+    }
+    @ObservationIgnored private var overviewCache: (at: Date, snapshot: Date?, value: DayOverview?)?
+
     func currentNudge() -> Freshness.Nudge? {
         #if os(iOS)
         let isPad = true
@@ -109,7 +134,25 @@ final class SmithBrain {
     }
 
     private var runner: ChatRunner {
-        ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }), tools: tools())
+        ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }), tools: tools(),
+                   phraseGuard: PhraseGuard(phrases: store.settings.bannedPhrases))
+    }
+
+    /// Fresh every time: never the same opening, phrase or joke twice; nothing
+    /// brought up (the weather, the time, their schedule) unless it fits what they said.
+    /// Plus any words they've asked Smith never to use.
+    private var styleRules: SystemBlock {
+        var rules = """
+            Keep it fresh. Don't reuse an opening, a phrase, a joke or a sign-off you've already used in this \
+            conversation or that shows up in the recent conversation summaries; say things a new way each time. \
+            Answer what they actually said. Don't mention the weather, the time or their schedule unless they ask \
+            or it truly bears on what they said (the morning briefing is the exception).
+            """
+        let custom = store.settings.customBannedPhrases.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        if !custom.isEmpty {
+            rules += "\n\nNever use these words or phrases, in any form: " + custom.map { "\"\($0)\"" }.joined(separator: ", ") + "."
+        }
+        return SystemBlock(rules)
     }
 
     // MARK: talking
@@ -117,9 +160,13 @@ final class SmithBrain {
     /// Sends what they said or typed. `spoken` replies are kept speakable and read aloud.
     func send(_ text: String, spoken: Bool) async {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty else { return }
+        // Locked: nothing is sent and nothing is answered, whoever asks (typing, voice, the wake word)
+        guard !t.isEmpty, chronicles.isUnlocked else { return }
         chronicles.noteActivity()
         idleTimer?.invalidate()
+        // One reply at a time: a second message sent while Smith is still answering waits
+        // its turn. Two at once would each finish by replacing the other's history.
+        while let running = current { await running.value; if current == running { current = nil } }
         let line = ChatLine(who: .you, text: t)
         turns.append(Turn(lineID: line.id, messageCount: messages.count, text: t))
         lines.append(line)
@@ -183,28 +230,50 @@ final class SmithBrain {
         return removeLastTurn()
     }
 
+    /// Smith's latest reply, said again a different way.
+    var canRegenerate: Bool { !isThinking && turns.last != nil && lines.last?.who == .smith }
+
+    func regenerate() async {
+        guard canRegenerate, let turn = turns.last else { return }
+        voice.stopSpeaking()
+        current?.cancel(); current = nil
+        // Back to just after what they said
+        messages = Array(messages.prefix(turn.messageCount + 1))
+        if let i = lines.firstIndex(where: { $0.id == turn.lineID }) { lines.removeSubrange((i + 1)...) }
+        // A different answer this time (an instruction for this turn only)
+        // (With the system prompt, not in the history: the history only ever holds what was said)
+        let again = SystemBlock("Answer their last message again, freshly: a different angle and different wording from any earlier attempt.")
+        let task = Task { await respond(spoken: !store.settings.muted, extraRules: [again]) }
+        current = task
+        await task.value
+        if current == task { current = nil }
+    }
+
     /// Clears this chat. Nothing is kept from it: no summary, no facts.
     func startOver() {
         current?.cancel(); current = nil
         voice.cancelListening(); voice.stopSpeaking()
         conversationMode = false
         idleTimer?.invalidate()
+        // Nothing from it is kept: a summary saved at a pause goes too
+        if let id = summaryID { store.deleteConversation(id) }
+        summaryID = nil
         messages = []; lines = []; turns = []; noted = []
         safety.endConversation()
         isThinking = false; workingOn = nil
         refreshHeadline()
     }
 
-    private func respond(spoken: Bool) async {
+    private func respond(spoken: Bool, extraRules: [SystemBlock] = []) async {
         let speak = spoken || (store.settings.speakTypedReplies && !store.settings.muted)
         isThinking = true
         lastError = nil
-        defer { isThinking = false; workingOn = nil; scheduleIdleEnd() }
+        defer { isThinking = false; workingOn = nil; scheduleCheckpoint() }
         let ctx = context()
         let runner = self.runner
         // Medium: enough thought to catch sarcasm, irony and a running joke; still quick
         let request = ClaudeRequest(model: store.settings.model, maxTokens: 16000, effort: "medium",
-                                    system: ctx.systemBlocks(spoken: speak && !store.settings.muted) + safety.extraRules,
+                                    system: ctx.systemBlocks(spoken: speak && !store.settings.muted) + [styleRules] + safety.extraRules + extraRules,
                                     messages: messages, tools: runner.toolDefinitions(webSearch: true))
         let voice = self.voice
         let muted = store.settings.muted
@@ -212,6 +281,16 @@ final class SmithBrain {
         let (events, sink) = AsyncStream<ChatEvent>.makeStream()
         let turnID = turns.last?.lineID
         let lastUser = turns.last?.text ?? ""
+        // What goes to Claude for this reply, to show under it
+        var sent = SentInfo()
+        if !lastUser.isEmpty { sent.parts.append(.init(title: "Your message", text: lastUser)) }
+        let earlier = max(0, messages.count - 1)
+        if earlier > 0 { sent.parts.append(.init(title: "Earlier in this chat", text: "\(earlier) earlier message\(earlier == 1 ? "" : "s") in this conversation: what you said and Smith's replies.")) }
+        if let about = ctx.aboutYou { sent.parts.append(.init(title: "What Smith knows about you", text: about)) }
+        if !ctx.recentConversations.isEmpty {
+            sent.parts.append(.init(title: "Recent conversation summaries", text: ctx.recentConversations.suffix(6).map { "\($0.day): \($0.text)" }.joined(separator: "\n")))
+        }
+        sent.parts.append(.init(title: "Your day, from Chronicles", text: ctx.dayText()))
         // In safe mode a reply is held until it's been screened whole; otherwise each
         // sentence is checked on this device as it arrives, and the whole reply afterwards.
         let holdForScreening = safety.safeMode
@@ -224,7 +303,10 @@ final class SmithBrain {
                 guard let self, self.turns.last?.lineID == turnID, !state.withheld else { return }
                 if let id = reply.id, let i = self.lines.firstIndex(where: { $0.id == id }) { self.lines[i].text += " " + s }
                 else { let line = ChatLine(who: .smith, text: s); reply.id = line.id; self.lines.append(line) }
-                if let id = reply.id, let line = self.lines.first(where: { $0.id == id }) { self.headline = line.text }
+                if let id = reply.id, let i = self.lines.firstIndex(where: { $0.id == id }) {
+                    self.headline = self.lines[i].text
+                    if let sent = reply.sent { self.lines[i].sent = sent }
+                }
             }
             if speak && !muted { voice.speak(s, onStart: show) } else { show() }
         }
@@ -234,6 +316,7 @@ final class SmithBrain {
                 guard self.turns.last?.lineID == turnID, self.isThinking, !state.withheld else { continue }
                 switch event {
                 case .working(let name): self.workingOn = Self.workingLabel(name)
+                case .lookedUp(let tool, let result): state.lookups.append((tool, result))
                 case .sentence(let s):
                     self.workingOn = nil
                     state.all.append(s)
@@ -256,6 +339,11 @@ final class SmithBrain {
                 state.all.forEach(present)
             }
             guard !Task.isCancelled else { return }
+            // What was sent, now complete with the lookups, under the reply
+            sent.parts += state.lookups.map { .init(title: Self.lookupTitle($0.0), text: $0.1) }
+            sent.parts.append(.init(title: "Never sent", text: "Journal entry text, money amounts, wellness notes, and anything you keep from AI in Chronicles. Smith's own instructions (its personality and safety rules) go along too; they hold nothing about you."))
+            reply.sent = sent
+            if let id = reply.id, let i = lines.firstIndex(where: { $0.id == id }) { lines[i].sent = sent }
             messages = result.messages
             // A withheld reply isn't kept in the conversation; what was said instead is
             if state.withheld, let last = messages.indices.last, messages[last]["role"]?.string == "assistant" {
@@ -283,7 +371,22 @@ final class SmithBrain {
     /// Said instead of a reply that went somewhere harmful.
     static let withheldLine = "I won’t go into that one. I’d much rather hear how you’re doing."
 
-    final class ReplyState { var all: [String] = []; var withheld = false }
+    final class ReplyState { var all: [String] = []; var withheld = false; var lookups: [(String, String)] = [] }
+
+    static func lookupTitle(_ tool: String) -> String {
+        switch tool {
+        case "web_search": "Searched the web for"
+        case "today_overview": "Looked up: today's overview"
+        case "find_tasks": "Looked up: tasks"
+        case "goals_progress": "Looked up: goals"
+        case "bills_due": "Looked up: bills due (names and dates only)"
+        case "journal_summary": "Looked up: journal summary (no entry text)"
+        case "current_time": "Looked up: the time"
+        case "weather": "Looked up: the weather"
+        case "memory": "Memory"
+        default: "Did in Chronicles: " + tool.replacingOccurrences(of: "_", with: " ")
+        }
+    }
 
     /// A reply went somewhere harmful: it stops, isn't shown, and help appears instead.
     private func withhold(_ kind: RiskKind, reply: ReplyLine, state: ReplyState) {
@@ -338,6 +441,7 @@ final class SmithBrain {
 
     /// The morning briefing, spoken.
     func briefing(spoken: Bool = true) async {
+        guard chronicles.isUnlocked, !isThinking else { return }
         freshnessNudge = currentNudge()
         await weather.refresh(fahrenheit: store.settings.fahrenheit)
         pill = "MORNING BRIEFING"
@@ -355,6 +459,8 @@ final class SmithBrain {
 
     /// For Siri: a one-shot answer without touching the live conversation.
     func oneShot(_ question: String) async -> String {
+        // Siri can ask while Smith sits in the background, where the lock timer doesn't run
+        chronicles.checkAutoLock()
         if chronicles.isLocked {
             return chronicles.state == .notSetUp ? "Connect Smith to Chronicles first: open Smith and sign in."
                 : "Unlock Smith first: open Smith and enter your Chronicles password."
@@ -371,7 +477,7 @@ final class SmithBrain {
                                 tools: runner.toolDefinitions(webSearch: true))
         do {
             let r = try await runner.run(req) { _ in }
-            await wrapUp(r.messages)
+            await wrapUp(r.messages, ofLiveChat: false)
             return r.text
         } catch {
             return error.localizedDescription
@@ -380,14 +486,23 @@ final class SmithBrain {
 
     // MARK: ending a conversation
 
-    private func scheduleIdleEnd() {
+    /// A conversation never ends on its own: it stays until Done or Start over,
+    /// however long the pause. After 10 quiet minutes its summary is saved (and
+    /// kept up to date after later pauses), so nothing is lost if Smith is quit.
+    private func scheduleCheckpoint() {
         idleTimer?.invalidate()
         idleTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: false) { [weak self] _ in
-            Task { @MainActor in await self?.endConversation() }
+            Task { @MainActor in
+                guard let self, !self.isThinking, self.messages.contains(where: { $0["role"]?.string == "assistant" }) else { return }
+                await self.wrapUp(self.messages)
+            }
         }
     }
 
-    /// "That's all", closing the panel, or 10 idle minutes. Keeps a summary; discards the transcript.
+    /// This conversation's saved summary, updated rather than added again at each pause.
+    @ObservationIgnored private var summaryID: UUID?
+
+    /// "That's all" or Done. Keeps a summary; discards the transcript.
     func endConversation() async {
         idleTimer?.invalidate()
         voice.cancelListening()
@@ -399,11 +514,14 @@ final class SmithBrain {
         noted = []
         safety.endConversation()
         refreshHeadline()
+        let checkpoint = summaryID
+        summaryID = nil
         guard transcript.contains(where: { $0["role"]?.string == "assistant" }) else { return }
-        await wrapUp(transcript)
+        await wrapUp(transcript, replacing: checkpoint)
     }
 
-    private func wrapUp(_ transcript: [JSONValue]) async {
+    private func wrapUp(_ transcript: [JSONValue], replacing earlier: UUID? = nil, ofLiveChat: Bool = true) async {
+        let earlier = ofLiveChat ? (earlier ?? summaryID) : nil
         guard store.settings.memoryEnabled else { return }
         var result = await OnDeviceWrapUp.run(transcript: WrapUp.transcript(transcript, name: store.settings.name))
         if result == nil {
@@ -413,7 +531,16 @@ final class SmithBrain {
             }
         }
         guard let result else { return }
-        if !result.summary.isEmpty { store.addConversation(ConversationSummary(day: today, text: result.summary)) }
+        if !result.summary.isEmpty {
+            // The same conversation keeps one summary, brought up to date
+            if let earlier, store.conversations.contains(where: { $0.id == earlier }) {
+                store.editConversation(earlier, text: result.summary)
+            } else {
+                let s = ConversationSummary(day: today, text: result.summary)
+                store.addConversation(s)
+                if ofLiveChat, !messages.isEmpty { summaryID = s.id }
+            }
+        }
         let added = store.aboutYou.suggest(result.facts)
         noted.append(contentsOf: added)
     }
@@ -423,15 +550,29 @@ final class SmithBrain {
     func refreshHeadline() {
         let hour = Calendar.current.component(.hour, from: Date())
         let name = store.snapshot?.displayName.map { ", \($0)" } ?? ""
+        // A few ways to say it, chosen afresh each part of the day (steady while it lasts)
+        let part: String, options: [String]
         switch hour {
-        case 5..<12: headline = "Good morning\(name)."; pill = "MORNING BRIEFING"
-        case 12..<17: headline = "Good afternoon\(name)."; pill = "YOUR DAY"
-        case 17..<22: headline = "Good evening\(name). How was today?"; pill = "DAILY REFLECTION"
-        default: headline = "It's late\(name). Anything on your mind?"; pill = "LATE NIGHT"
+        case 5..<12:
+            part = "morning"; pill = "MORNING BRIEFING"
+            options = ["Good morning\(name).", "Morning\(name). What's first today?", "Morning\(name). Ready when you are."]
+        case 12..<17:
+            part = "afternoon"; pill = "YOUR DAY"
+            options = ["Good afternoon\(name).", "Afternoon\(name). How's it going?", "How's the day treating you\(name)?"]
+        case 17..<22:
+            part = "evening"; pill = "DAILY REFLECTION"
+            options = ["Good evening\(name). How was today?", "Evening\(name). How did the day go?", "Evening\(name). Anything worth telling me about today?"]
+        default:
+            part = "late"; pill = "LATE NIGHT"
+            options = ["It's late\(name). Anything on your mind?", "Still up\(name)? What's on your mind?", "Late one tonight\(name). Want to talk?"]
         }
+        if headlineChoice?.part != part { headlineChoice = (part, Int.random(in: 0..<options.count)) }
+        headline = options[min(headlineChoice!.index, options.count - 1)]
         if store.snapshot == nil { headline = "Import your Chronicles export to get started."; pill = "WELCOME" }
         if APIKeys.current() == nil { headline = "Add your Anthropic API key in Settings, or turn on In-App AI in Chronicles."; pill = "SETUP" }
     }
+
+    @ObservationIgnored private var headlineChoice: (part: String, index: Int)?
 
     func dismissNoted(_ id: UUID) { noted.removeAll { $0.id == id } }
 
@@ -441,7 +582,11 @@ final class SmithBrain {
         lines = [ChatLine(who: .you, text: "The doctor said everything looks good!"),
                  ChatLine(who: .smith, text: "*beams* Oh, that's such a relief. You've been carrying that one around all week, and now you can finally put it down."),
                  ChatLine(who: .you, text: "Right? I celebrated with a giant cinnamon roll."),
-                 ChatLine(who: .smith, text: "*laughs* As you should. Medical good news legally requires a pastry.")]
+                 ChatLine(who: .smith, text: "*laughs* As you should. Medical good news legally requires a pastry.",
+                          sent: SentInfo(parts: [.init(title: "Your message", text: "Right? I celebrated with a giant cinnamon roll."),
+                                                 .init(title: "Earlier in this chat", text: "2 earlier messages in this conversation."),
+                                                 .init(title: "Your day, from Chronicles", text: "Now: Thursday 26 November 2026, 10:15.\n\nEvents today: none."),
+                                                 .init(title: "Never sent", text: "Journal entry text, money amounts, wellness notes, and anything you keep from AI in Chronicles.")]))]
         turns = [Turn(lineID: lines[2].id, messageCount: 2, text: lines[2].text)]
     }
     #endif
@@ -503,6 +648,7 @@ enum HenryWriter {
 
     static func write(store: SmithStore, message: String?) async throws -> Written {
         let safety = AppModel.shared.safety
+        AppModel.shared.chronicles.checkAutoLock()
         guard AppModel.shared.chronicles.isUnlocked else { throw ClaudeError.unavailable("Open Smith and sign in to Chronicles first.") }
         if let reason = safety.unavailableReason { throw ClaudeError.unavailable(reason) }
         let p = store.settings.henry
@@ -530,11 +676,27 @@ enum HenryWriter {
         let about = store.aboutYou.shareWithHenry ? store.aboutYou.contextText() : nil
         var system = [SystemBlock(HenryPrompt.system(p, defaultName: store.settings.name), cache: true)]
         if risk.isRisk { system.append(SystemBlock(ChatSafety.letterSafeRules)) }
+        // Never the same letter twice: the recent ones are shown, with a fresh focus to write from
+        let recent = store.letters.sorted { $0.date > $1.date }.prefix(5).map { String($0.text.prefix(700)) }
+        let focus = ["one small, specific moment from their recent days", "something you admire in them that you haven't said before",
+                     "a hope or a plan for the two of you", "a memory you imagine sharing with them", "something playful or teasing",
+                     "what they bring to an ordinary evening", "a question you'd love to hear them answer", "a quiet, tender thought"].randomElement()!
+        var ask = HenryPrompt.userMessage(theirMessage: message, dayContext: day, aboutThem: about)
+        ask += "\n\nThis letter's focus: \(focus)."
+        if !recent.isEmpty {
+            ask += "\n\nLetters you've already written them (newest first). Write something new: a different greeting and opening line, "
+                + "different images and phrases, a different sign-off, and don't retell the same events or details:\n\n"
+                + recent.enumerated().map { "Letter \($0.offset + 1):\n\($0.element)" }.joined(separator: "\n\n")
+        }
+        // The whole list, not only their own additions: a banned word the letter uses is cut
+        // out afterwards, which leaves a hole in the sentence ("You looked tonight")
+        let banned = store.settings.bannedPhrases
+        if !banned.isEmpty { system.append(SystemBlock("Never use these words or phrases: " + banned.map { "\"\($0)\"" }.joined(separator: ", ") + ".")) }
         let runner = ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }), tools: [])
         let req = ClaudeRequest(model: store.settings.model, maxTokens: 4000, effort: "medium", system: system,
-                                messages: [["role": "user", "content": .string(HenryPrompt.userMessage(theirMessage: message, dayContext: day, aboutThem: about))]])
+                                messages: [["role": "user", "content": .string(ask)]])
         var text = try await runner.complete(req)
-        let guardrail = PhraseGuard()
+        let guardrail = PhraseGuard(phrases: store.settings.bannedPhrases)
         text = guardrail.findBanned(in: text).isEmpty ? text : guardrail.scrub(text)
         // The letter itself is screened before it's shown or read aloud
         if let kind = await safety.harmfulKind(reply: text, lastUser: theirs) {

@@ -18,9 +18,14 @@ import Testing
         let r = try await ChatRunner(transport: transport, tools: [Echo()]).run(
             ClaudeRequest(model: .opus, system: [SystemBlock("s")], messages: [["role": "user", "content": "go"]])
         ) { e in
-            switch e { case .sentence(let s): events.add("say:" + s); case .working(let n): events.add("tool:" + n) }
+            switch e {
+            case .sentence(let s): events.add("say:" + s)
+            case .working(let n): events.add("tool:" + n)
+            case .lookedUp(let tool, let result): events.add("sent:\(tool)=\(result)")
+            }
         }
-        #expect(events.items == ["tool:echo", "say:Done.", "say:All good."])
+        // The tool's answer is reported too ("what was sent")
+        #expect(events.items == ["tool:echo", "sent:echo=got hi", "say:Done.", "say:All good."])
         #expect(r.messages.count == 4) // user, assistant(tool_use), user(tool_result), assistant(text)
         #expect(r.messages[2]["content"]?.array?.first?["content"]?.string == "got hi")
         // The thinking block is sent back unchanged, signature included.

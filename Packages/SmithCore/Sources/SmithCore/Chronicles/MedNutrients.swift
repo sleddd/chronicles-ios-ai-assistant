@@ -90,7 +90,7 @@ public enum MedNutrients {
         var source: [String: JSONValue] = [:]
         for k in keys {
             if let v = values[k] {
-                cf[k] = .string(v == v.rounded() ? String(Int(v)) : String(v))
+                cf[k] = .string(Int(exactly: v).map { String($0) } ?? String(v))
                 source[k] = "manual"
             } else {
                 cf[k] = ""

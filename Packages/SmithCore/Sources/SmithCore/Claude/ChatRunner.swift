@@ -27,6 +27,8 @@ public enum ChatEvent: Sendable, Equatable {
     case sentence(String)
     /// Smith is using a tool ("web_search", "find_tasks"…).
     case working(String)
+    /// A tool's answer, which went to Claude (for "what was sent"). For web search, the query.
+    case lookedUp(tool: String, result: String)
 }
 
 public struct ChatTurnResult: Sendable {
@@ -79,6 +81,10 @@ public struct ChatRunner: Sendable {
             splitter.flush().forEach(emit)
             request.messages.append(["role": "assistant", "content": .array(acc.contentForEcho)])
 
+            // Web searches: what was searched for (the results go to Claude from the search itself)
+            for block in acc.content where block["type"]?.string == "server_tool_use" {
+                if let q = block["input"]?["query"]?.string { onEvent(.lookedUp(tool: block["name"]?.string ?? "web_search", result: q)) }
+            }
             switch acc.stopReason {
             case "tool_use":
                 var results: [JSONValue] = []
@@ -88,8 +94,11 @@ public struct ChatRunner: Sendable {
                     if acc.invalidToolIDs.contains(id) {
                         results.append(toolResult(id, "The tool input was incomplete or not valid JSON. Try again.", error: true))
                     } else if let tool = tools.first(where: { $0.name == name }) {
-                        do { results.append(toolResult(id, try await tool.run(block["input"] ?? [:]), error: false)) }
-                        catch { results.append(toolResult(id, "Tool failed: \(error.localizedDescription)", error: true)) }
+                        do {
+                            let out = try await tool.run(block["input"] ?? [:])
+                            onEvent(.lookedUp(tool: name, result: out))
+                            results.append(toolResult(id, out, error: false))
+                        } catch { results.append(toolResult(id, "Tool failed: \(error.localizedDescription)", error: true)) }
                     } else {
                         results.append(toolResult(id, "No tool named \(name).", error: true))
                     }
@@ -102,6 +111,13 @@ public struct ChatRunner: Sendable {
                 if shown.isEmpty { emit("I can't help with that one.") }
                 return ChatTurnResult(text: shown.joined(separator: " "), messages: request.messages)
             default: // end_turn, max_tokens, stop_sequence
+                // Cut off (the length limit) while asking for a tool: that request was never
+                // answered, and the API refuses any later message while it sits in the history
+                if let last = request.messages.indices.last, let content = request.messages[last]["content"]?.array,
+                   content.contains(where: { $0["type"]?.string == "tool_use" }) {
+                    let kept = content.filter { $0["type"]?.string == "text" && !($0["text"]?.string ?? "").isEmpty }
+                    request.messages[last] = ["role": "assistant", "content": .array(kept.isEmpty ? [["type": "text", "text": "(My answer was cut short.)"]] : kept)]
+                }
                 return ChatTurnResult(text: shown.joined(separator: " "), messages: request.messages)
             }
         }

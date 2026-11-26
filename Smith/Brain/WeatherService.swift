@@ -9,7 +9,15 @@ final class WeatherService: NSObject, CLLocationManagerDelegate {
     private(set) var report: WeatherReport?
     private(set) var lastFetch: Date?
     private let manager = CLLocationManager()
-    private var waiter: CheckedContinuation<CLLocation?, Never>?
+    private var waiters: [CheckedContinuation<CLLocation?, Never>] = []
+    private var locationRound = 0
+
+    private func finishLocation(_ l: CLLocation?) {
+        let waiting = waiters
+        waiters = []
+        locationRound += 1
+        waiting.forEach { $0.resume(returning: l) }
+    }
 
     override init() {
         super.init()
@@ -65,24 +73,33 @@ final class WeatherService: NSObject, CLLocationManagerDelegate {
         default: break
         }
         return await withCheckedContinuation { c in
-            waiter = c
+            // Several can ask at once (launch, Settings, the weather tool): all are answered together
+            waiters.append(c)
+            guard waiters.count == 1 else { return }
             manager.requestLocation()
+            // An unanswered permission prompt sends nothing back: don't wait on it for ever
+            let round = locationRound
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(10))
+                guard let self, self.locationRound == round else { return }
+                self.finishLocation(self.manager.location)
+            }
         }
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         let l = locations.last
-        Task { @MainActor in self.waiter?.resume(returning: l); self.waiter = nil }
+        Task { @MainActor in self.finishLocation(l) }
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-        Task { @MainActor in self.waiter?.resume(returning: nil); self.waiter = nil }
+        Task { @MainActor in self.finishLocation(nil) }
     }
 
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         let denied = manager.authorizationStatus == .denied
         Task { @MainActor in
-            if denied { self.waiter?.resume(returning: nil); self.waiter = nil }
+            if denied, !self.waiters.isEmpty { self.finishLocation(nil) }
         }
     }
 }

@@ -10,7 +10,11 @@ public enum UndoAction: Sendable, Equatable {
     case deleteEntry(id: Int)
     case restoreEntry(id: Int, content: String, metadata: JSONValue)
     case restoreDose(uuid: String, date: String, previous: JSONValue?)
-    case restoreHabitLog(previous: JSONValue)
+    /// Takes one check-in back off a habit's day (other check-ins made since stay).
+    case uncheckHabit(habitID: Int, day: String)
+    /// Puts back just these custom fields on an entry (nil = the field wasn't there),
+    /// leaving whatever else was changed on it since.
+    case restoreFields(id: Int, fields: [String: JSONValue?])
     case removeBillPayment(billID: String, paymentID: String)
     /// Several at once (a dose and the Meals row it added), undone last first.
     indirect case all([UndoAction])
@@ -81,6 +85,35 @@ public struct ChroniclesWriter: Sendable {
         return id
     }
 
+    // MARK: wellness
+
+    /// Today's wellness check-in (Chronicles' wellness card): the fields given are
+    /// set, `addWater` glasses added; everything else on the card is left as it is.
+    /// Creates the day's check-in the way Chronicles does when there isn't one.
+    public func saveWellness(entryID: Int?, day: String, set: [String: JSONValue], addWater: Int, topicID: Int?) async throws -> UndoAction {
+        func water(_ current: Int) -> JSONValue { .number(Double(max(0, min(20, current + addWater)))) }
+        if let id = entryID {
+            let old = try await updateEntry(id: id) { _, meta in
+                var cf = meta["_customFields"]?.object ?? [:]
+                for (k, v) in set { cf[k] = v }
+                if addWater != 0 { cf["waterGlasses"] = water(cf["waterGlasses"]?.int ?? 0) }
+                meta["_customFields"] = .object(cf)
+            }
+            let before = old.metadata["_customFields"]?.object ?? [:]
+            var touched = Set(set.keys)
+            if addWater != 0 { touched.insert("waterGlasses") }
+            return .restoreFields(id: id, fields: Dictionary(uniqueKeysWithValues: touched.map { ($0, before[$0]) }))
+        }
+        var cf: [String: JSONValue] = ["date": .string(day), "waterGlasses": 0, "waterGoal": 8, "moodScore": 0,
+                                       "sleepHours": 0, "sleepQuality": 0, "periodToday": false, "flowIntensity": ""]
+        for (k, v) in set { cf[k] = v }
+        if addWater != 0 { cf["waterGlasses"] = water(0) }
+        var meta: [String: JSONValue] = ["_widgetType": "wellness-checkin", "_customFields": .object(cf)]
+        if let topicID { meta["_taxonomyId"] = .number(Double(topicID)) }
+        let id = try await createEntry(content: "", metadata: .object(meta))
+        return .deleteEntry(id: id)
+    }
+
     // MARK: Smith's records
 
     public func createSmithRecord(_ record: SmithRecord, topicID: Int) async throws -> Int {
@@ -88,10 +121,18 @@ public struct ChroniclesWriter: Sendable {
         return try await createEntry(content: e.content, metadata: e.metadata, owned: true)
     }
 
-    public func updateSmithRecord(entryID: Int, _ record: SmithRecord, topicID: Int) async throws {
+    /// `theirs`: an entry the person wrote in Chronicles. Its text and Smith's fields are
+    /// updated; everything else on it (its topic, its own fields) stays, and it stays theirs.
+    public func updateSmithRecord(entryID: Int, _ record: SmithRecord, topicID: Int, theirs: Bool = false) async throws {
         let e = record.entry(topicID: topicID)
         _ = try await updateEntry(id: entryID) { content, meta in
             content = e.content
+            if theirs {
+                var cf = meta["_customFields"]?.object ?? [:]
+                for (k, v) in e.metadata["_customFields"]?.object ?? [:] where k != "smithKind" && k != "smithId" { cf[k] = v }
+                meta["_customFields"] = .object(cf)
+                return
+            }
             // Keep whatever else Chronicles stored on the entry; replace Smith's fields
             meta["_taxonomyId"] = .number(Double(topicID))
             meta["_customFields"] = e.metadata["_customFields"]
@@ -140,7 +181,7 @@ public struct ChroniclesWriter: Sendable {
     /// An as-needed dose: its own record every time, timed to the second.
     public func logAsNeededDose(medicationID: Int, date: String, now: Date = Date()) async throws -> UndoAction {
         let uuid = UUID().uuidString.lowercased()
-        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "HH:mm:ss"
         let record: JSONValue = [
             "medicationPostId": .number(Double(medicationID)), "scheduledTime": .string(f.string(from: now)),
             "status": "taken", "takenAt": .string(Self.takenAtText(now)), "asNeeded": true,
@@ -152,7 +193,7 @@ public struct ChroniclesWriter: Sendable {
 
     /// "1:35 PM", the way Chronicles shows a taken time.
     static func takenAtText(_ d: Date) -> String {
-        let f = DateFormatter(); f.locale = Locale(identifier: "en_US"); f.dateFormat = "h:mm a"
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "h:mm a"
         return f.string(from: d)
     }
 
@@ -165,7 +206,14 @@ public struct ChroniclesWriter: Sendable {
         let previous = try sealed.map { try ChroniclesCrypto.openSetting(key: "habitLog", sealed: $0, keys: session.keys) } ?? .object([:])
         let next = Self.incrementHabit(previous, habitID: habitID, day: day, by: 1)
         try await putHabitLog(next)
-        return .restoreHabitLog(previous: previous)
+        return .uncheckHabit(habitID: habitID, day: day)
+    }
+
+    /// The habit log as it is now, opened.
+    func habitLog() async throws -> JSONValue {
+        let rows = try await client.call("GET", "/api/settings", nil, session).body.array ?? []
+        let sealed = rows.first { $0["key"]?.string == "habitLog" }?["value"]
+        return try sealed.map { try ChroniclesCrypto.openSetting(key: "habitLog", sealed: $0, keys: session.keys) } ?? .object([:])
     }
 
     func putHabitLog(_ value: JSONValue) async throws {
@@ -195,11 +243,7 @@ public struct ChroniclesWriter: Sendable {
     /// Records a payment for the next unpaid due date (Chronicles' markBillPaid).
     /// The amount is read here, in memory, to record the payment, and goes nowhere else.
     public func markBillPaid(billID: String, today: String) async throws -> (summary: String, undo: UndoAction) {
-        let r = try await client.call("GET", "/api/finance/bills?v=2", nil, session)
-        guard let row = (r.body["records"]?.array ?? []).first(where: { $0["id"]?.string == billID }),
-              let p = row["payload"]?.string, let iv = row["iv"]?.string,
-              var bill = try ChroniclesCrypto.openRecord(kind: "bills", id: billID, payload: p, iv: iv, keys: session.keys).object
-        else { throw ChroniclesError.notFound("That bill wasn’t found.") }
+        guard var bill = try await billRecord(billID) else { throw ChroniclesError.notFound("That bill wasn’t found.") }
         let schedule = ExportParser.bills(from: ["bills": [.object(bill.merging(["id": .string(billID)]) { a, _ in a })]]).first
         guard let schedule, let due = schedule.nextUnpaidDue(today: today) else {
             throw ChroniclesError.refused("That bill is already marked paid.")
@@ -216,6 +260,20 @@ public struct ChroniclesWriter: Sendable {
         try await putBill(billID, .object(bill))
         let name = bill["name"]?.string ?? "The bill"
         return ("\(name) marked paid for \(Day.short(due)).", .removeBillPayment(billID: billID, paymentID: paymentID))
+    }
+
+    /// One bill, read afresh and opened; the list comes in pages, so every page is looked through.
+    func billRecord(_ billID: String) async throws -> [String: JSONValue]? {
+        var offset = 0
+        while true {
+            let r = try await client.call("GET", "/api/finance/bills?v=2&offset=\(offset)", nil, session)
+            let rows = r.body["records"]?.array ?? []
+            if let row = rows.first(where: { $0["id"]?.string == billID }), let p = row["payload"]?.string, let iv = row["iv"]?.string {
+                return try ChroniclesCrypto.openRecord(kind: "bills", id: billID, payload: p, iv: iv, keys: session.keys).object
+            }
+            offset += rows.count
+            if r.body["more"]?.bool != true || rows.isEmpty { return nil }
+        }
     }
 
     func putBill(_ id: String, _ record: JSONValue) async throws {
@@ -245,13 +303,18 @@ public struct ChroniclesWriter: Sendable {
                 rec["status"] = "pending"; rec["takenAt"] = .null
             }
             try await putDose(uuid: uuid, date: date, record: .object(rec))
-        case .restoreHabitLog(let previous):
-            try await putHabitLog(previous)
+        case .uncheckHabit(let habitID, let day):
+            // Read afresh and take one off: putting the whole log back as it was would
+            // also wipe every check-in made since (here or in Chronicles)
+            try await putHabitLog(Self.incrementHabit(try await habitLog(), habitID: habitID, day: day, by: -1))
+        case .restoreFields(let id, let fields):
+            _ = try await updateEntry(id: id) { _, meta in
+                var cf = meta["_customFields"]?.object ?? [:]
+                for (k, v) in fields { cf[k] = v }
+                meta["_customFields"] = .object(cf)
+            }
         case .removeBillPayment(let billID, let paymentID):
-            let r = try await client.call("GET", "/api/finance/bills?v=2", nil, session)
-            guard let row = (r.body["records"]?.array ?? []).first(where: { $0["id"]?.string == billID }),
-                  let p = row["payload"]?.string, let iv = row["iv"]?.string,
-                  var bill = try ChroniclesCrypto.openRecord(kind: "bills", id: billID, payload: p, iv: iv, keys: session.keys).object else { return }
+            guard var bill = try await billRecord(billID) else { return }
             bill["payments"] = .array((bill["payments"]?.array ?? []).filter { $0["id"]?.string != paymentID })
             try await putBill(billID, .object(bill))
         }
