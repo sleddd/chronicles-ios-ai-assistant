@@ -1,0 +1,83 @@
+# Generate the Xcode project with:  xcodegen generate
+name: Smith
+options:
+  bundleIdPrefix: com.fastandcurious
+  deploymentTarget:
+    macOS: "26.0"
+    iOS: "26.0"
+  createIntermediateGroups: true
+packages:
+  SmithCore:
+    path: Packages/SmithCore
+settings:
+  base:
+    DEVELOPMENT_TEAM: BKCWUKBZ8J   # Personal Team (free Apple ID)
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  Smith:
+    type: application
+    supportedDestinations: [macOS, iOS]
+    sources:
+      - path: Smith
+    dependencies:
+      - package: SmithCore
+    entitlements:
+      path: Smith/Resources/Smith.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.security.network.server: true
+        com.apple.security.files.user-selected.read-write: true
+        com.apple.security.files.bookmarks.app-scope: true
+        com.apple.security.device.audio-input: true
+        com.apple.security.personal-information.location: true
+    info:
+      path: Smith/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: Smith
+        LSApplicationCategoryType: public.app-category.productivity
+        NSMicrophoneUsageDescription: Smith listens when you tap the orb or say "Hey Smith".
+        NSSpeechRecognitionUsageDescription: Your speech is turned into text on this device so Smith can answer.
+        NSLocationWhenInUseUsageDescription: Smith uses your approximate location for the weather.
+        NSLocationUsageDescription: Smith uses your approximate location for the weather.
+        NSLocalNetworkUsageDescription: Smith syncs directly between your Mac and iPad on your own network.
+        NSBonjourServices: [_smithsync._tcp]
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIRequiresFullScreen: true
+        UIStatusBarHidden: true
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Chronicles export
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [public.json]
+          - CFBundleTypeName: Smith data
+            CFBundleTypeRole: Editor
+            LSHandlerRank: Owner
+            LSItemContentTypes: [com.fastandcurious.smith.smithdata]
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: com.fastandcurious.smith.smithdata
+            UTTypeDescription: Smith data
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [smithdata]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.fastandcurious.smith
+        SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+        SWIFT_APPROACHABLE_CONCURRENCY: YES
+        TARGETED_DEVICE_FAMILY: "2"
+        SUPPORTS_MACCATALYST: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        ENABLE_HARDENED_RUNTIME: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_KEY_LSUIElement: NO

@@ -1,0 +1,161 @@
+import SwiftUI
+import SmithCore
+
+#if os(macOS)
+/// Mac start-up runs at launch, whether or not the main window is open
+/// (Smith often lives in the menu bar with its window closed).
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        Task { @MainActor in await SmithApp.macStartup() }
+    }
+    func applicationWillTerminate(_ notification: Notification) {
+        // Quitting locks: the key leaves with the process, and the session ends
+        MainActor.assumeIsolated { AppModel.shared.chronicles.lock() }
+    }
+}
+#endif
+
+@main
+struct SmithApp: App {
+    @State private var app = AppModel.shared
+    @Environment(\.scenePhase) private var phase
+    #if os(macOS)
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    #endif
+
+    var body: some Scene {
+        #if os(macOS)
+        Window("Smith", id: "main") {
+            RootView().environment(app)
+                .frame(minWidth: 520, minHeight: 680)
+        }
+        .windowStyle(.hiddenTitleBar)
+        .commands {
+            CommandGroup(after: .newItem) {
+                Button("Import Chronicles Export…") { NotificationCenter.default.post(name: .smithImport, object: nil) }
+                    .keyboardShortcut("i")
+            }
+        }
+
+        MenuBarExtra {
+            MenuBarContent().environment(app)
+        } label: {
+            Image(systemName: "circle.circle")
+        }
+        .menuBarExtraStyle(.menu)
+        #else
+        WindowGroup {
+            RootView().environment(app)
+        }
+        #endif
+    }
+
+    #if os(macOS)
+    @MainActor static func macStartup() async {
+        let app = AppModel.shared
+        #if DEBUG
+        DebugSnapshot.runIfRequested()
+        #endif
+        HotKey.shared.action = { PanelController.shared.toggle { PanelView().environment(AppModel.shared) } }
+        HotKey.shared.register()
+        WakeWatcher.shared.onFirstWakeOfDay = {
+            let app = AppModel.shared
+            guard app.store.settings.greetOnWake, app.store.settings.lastGreetingDay != Day.key() else { return }
+            PanelController.shared.show { PanelView().environment(app) }
+            app.morningBriefing()
+        }
+        WakeWatcher.shared.start { AppModel.shared.store.settings.lastGreetingDay }
+        WakeWordListener.shared.onWake = { after in
+            let app = AppModel.shared
+            PanelController.shared.show { PanelView().environment(app) }
+            if after.count > 3 { app.typedSpoken(after) } else { app.listenOnce() }
+            Task { try? await Task.sleep(for: .seconds(20)); if app.store.settings.macWakeWord { WakeWordListener.shared.start() } }
+        }
+        if app.store.settings.macWakeWord { WakeWordListener.shared.start() }
+    }
+    #endif
+}
+
+struct RootView: View {
+    @Environment(AppModel.self) private var app
+    @Environment(\.scenePhase) private var phase
+
+    var body: some View {
+        @Bindable var app = app
+        Group {
+            if app.chronicles.isLocked { LockView() } else { HomeView() }
+        }
+            .sheet(item: $app.sheet) { sheet in
+                switch sheet {
+                case .today: TodaySheet()
+                case .goals: GoalsSheet()
+                case .me: AboutYouView()
+                case .letters: LettersView()
+                case .settings: SettingsView()
+                }
+            }
+            .onOpenURL { app.openURL($0) }
+            .onChange(of: phase) { _, p in if p == .active { Task { await app.becameActive() } } }
+            .onChange(of: app.chronicles.state) { _, _ in app.brain.refreshHeadline() }
+            .onChange(of: app.chronicles.lastSync) { _, _ in app.brain.refreshHeadline() }
+            .task { await app.becameActive() }
+            .onReceive(NotificationCenter.default.publisher(for: .smithTalk)) { _ in app.listenOnce() }
+            .preferredColorScheme(.dark)
+    }
+}
+
+#if os(macOS)
+/// The floating panel: the same home screen, compact.
+struct PanelView: View {
+    @Environment(AppModel.self) private var app
+    var body: some View {
+        @Bindable var app = app
+        Group {
+            if app.chronicles.isLocked { LockView(compact: true) } else { HomeView(compact: true) }
+        }
+            .frame(width: 420, height: 640)
+            .sheet(item: $app.sheet) { sheet in
+                switch sheet {
+                case .today: TodaySheet()
+                case .goals: GoalsSheet()
+                case .me: AboutYouView()
+                case .letters: LettersView()
+                case .settings: SettingsView()
+                }
+            }
+    }
+}
+
+struct MenuBarContent: View {
+    @Environment(AppModel.self) private var app
+    @Environment(\.openWindow) private var openWindow
+    var body: some View {
+        Button("Talk to \(app.store.settings.name)  ⌥Space") {
+            PanelController.shared.show { PanelView().environment(app) }
+            app.listenOnce()
+        }
+        Button("Morning briefing") {
+            PanelController.shared.show { PanelView().environment(app) }
+            app.morningBriefing()
+        }
+        Button("Open window") { openWindow(id: "main"); NSApp.activate() }
+        if app.chronicles.isUnlocked { Button("Lock \(app.store.settings.name)") { app.chronicles.lock() } }
+        Divider()
+        Button("Import Chronicles export…") { openWindow(id: "main"); NSApp.activate(); NotificationCenter.default.post(name: .smithImport, object: nil) }
+        if app.sync.isPaired { Button("Sync with iPad") { Task { await app.sync.syncNow() } } }
+        if app.store.settings.macWakeWord {
+            Button("Pause \"Hey Smith\" for 1 hour") { WakeWordListener.shared.pause() }
+        }
+        Divider()
+        Button("Quit Smith") { NSApp.terminate(nil) }
+    }
+}
+#endif
+
+extension AppModel {
+    /// Wake word with the request in the same breath: "Hey Smith, what's on today?"
+    func typedSpoken(_ text: String) {
+        showChat = true
+        Task { await brain.send(text, spoken: true) }
+    }
+}

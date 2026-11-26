@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+Packages/SmithCore/.build/
+Packages/SmithCore/.swiftpm/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+Smith.xcodeproj/
+*.smithdata
+chronicles-export-*.json

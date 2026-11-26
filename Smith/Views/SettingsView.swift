@@ -1,0 +1,471 @@
+import SwiftUI
+import AVFoundation
+import UniformTypeIdentifiers
+import SmithCore
+
+struct SettingsView: View {
+    @Environment(AppModel.self) private var app
+    @State private var apiKey = Keychain.apiKey ?? ""
+    @State private var pickFolder = false
+    @State private var exportingBackup: SmithDataDocument?
+    @State private var pairCode = ""
+    @State private var confirmErase = false
+    @State private var newSample = ""
+    @State private var elevenKey = ""
+    @State private var elevenVoices: [ElevenLabs.Voice] = []
+    @State private var elevenError: String?
+    @State private var elevenLoading = false
+    @State private var hasElevenKey = ElevenLabs.apiKey != nil
+    @State private var elevenStatus: String?
+    @State private var cityQuery = ""
+    @State private var cityStatus: String?
+
+    var body: some View {
+        @Bindable var store = app.store
+        let s = store.settings
+        GlassSheet(title: "Settings") {
+            Group {
+                SectionLabel("Claude")
+                GlassCard {
+                    Toggle("Use the AI key from Chronicles", isOn: Binding(get: { s.useChroniclesAIKey }, set: { v in
+                        store.updateLocalSettings { $0.useChroniclesAIKey = v }; app.applyVoiceSettings(); app.brain.refreshHeadline() }))
+                    Caps(APIKeys.usingChronicles
+                         ? "Using your Anthropic key from Chronicles (In-App AI). It stays in memory only while Smith is unlocked."
+                         : "Used when Smith is unlocked and Chronicles' In-App AI uses Anthropic. Otherwise the key below is used.",
+                         size: 8, color: Theme.faint)
+                    SecureField("", text: $apiKey, prompt: Text(APIKeys.usingChronicles ? "Fallback API key (optional)" : "Anthropic API key").foregroundStyle(Theme.faint)).textFieldStyle(.plain)
+                        .onSubmit { Keychain.apiKey = apiKey; app.brain.refreshHeadline() }
+                    Button("Save key") { Keychain.apiKey = apiKey; app.brain.refreshHeadline() }.buttonStyle(.plain).foregroundStyle(Theme.violet)
+                    Caps("\(Keychain.storageDescription). Never synced.", size: 8, color: Theme.faint)
+                    Picker("Model", selection: binding(\.model)) { ForEach(ClaudeModel.allCases, id: \.self) { Text($0.label).tag($0) } }
+                }
+
+                SectionLabel("Smith")
+                GlassCard {
+                    TextField("Name", text: binding(\.name)).textFieldStyle(.plain)
+                    voicePicker("Voice", selection: Binding(get: { s.smithVoiceID }, set: { v in store.updateLocalSettings { $0.smithVoiceID = v }; app.applyVoiceSettings() }),
+                                sample: "Good morning. Here's what's on today.")
+                    HStack { Text("Speaking speed"); Slider(value: Binding(get: { Double(s.speechRate) }, set: { v in store.updateLocalSettings { $0.speechRate = Float(v) }; app.applyVoiceSettings() })) }
+                    Picker("When I pause, wait", selection: Binding(get: { s.pauseWait }, set: { v in store.updateSettings { $0.pauseWait = v }; app.applyVoiceSettings() })) {
+                        Text("2 seconds").tag(2.0); Text("3 seconds").tag(3.0); Text("5 seconds").tag(5.0); Text("Until I tap").tag(0.0)
+                    }
+                    Caps("Tap the orb anytime to say you're done.", size: 8, color: Theme.faint)
+                    Toggle("Speak replies to typed messages", isOn: binding(\.speakTypedReplies))
+                    Toggle("Mention a goal in the morning briefing", isOn: binding(\.goalMentionInBriefing))
+                    Toggle("Temperatures in °F", isOn: Binding(get: { s.fahrenheit }, set: { v in store.updateSettings { $0.fahrenheit = v }; app.applyVoiceSettings() }))
+                    Caps("Voices: download Enhanced or Premium voices in System Settings → Accessibility → Spoken Content.", size: 8, color: Theme.faint)
+                }
+
+                SectionLabel("Weather")
+                GlassCard { weatherCard }
+
+                SectionLabel("ElevenLabs voices")
+                GlassCard { elevenCard }
+            }
+            Group {
+                SectionLabel("Chronicles")
+                GlassCard { chroniclesCard }
+
+                SectionLabel(app.chronicles.state == .notSetUp ? "Chronicles data" : "Backup: import an export")
+                GlassCard {
+                    if let snap = store.snapshot {
+                        Text("Data as of \(snap.exportedAt.formatted(date: .abbreviated, time: .shortened))").font(Theme.rounded(14))
+                    } else { Text("Nothing imported yet.").foregroundStyle(Theme.dim) }
+                    Button("Import Chronicles export…") { app.sheet = nil; NotificationCenter.default.post(name: .smithImport, object: nil) }
+                        .buttonStyle(.plain).foregroundStyle(Theme.violet)
+                    Button(s.watchedFolderBookmark == nil ? "Choose a folder to watch…" : "Change watched folder…") { pickFolder = true }
+                        .buttonStyle(.plain).foregroundStyle(Theme.violet)
+                    Caps("In Chronicles: Settings → Data → Export All. Save it to the watched folder or share it to Smith.", size: 8, color: Theme.faint)
+                }
+
+                SectionLabel("Journal")
+                GlassCard {
+                    Picker("Share with Smith", selection: binding(\.journalMode)) { ForEach(JournalShareMode.allCases, id: \.self) { Text($0.label).tag($0) } }
+                    Text("What would be sent:").font(Theme.rounded(12)).foregroundStyle(Theme.dim)
+                    Text(store.journalDigestText ?? "Nothing.").font(Theme.rounded(13)).padding(8).background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+                    Caps(OnDevice.unavailableReason ?? "Journal entries are summarized on this device and the text is discarded.", size: 8, color: Theme.faint)
+                    if let topics = store.snapshot?.topics, !topics.isEmpty {
+                        Text("Never mention").font(Theme.rounded(13, .medium)).padding(.top, 6)
+                        ForEach(topics.sorted { $0.value < $1.value }, id: \.key) { id, name in
+                            Toggle(name, isOn: Binding(get: { s.neverMentionTopics.contains(id) },
+                                                       set: { on in store.updateSettings { if on { $0.neverMentionTopics.insert(id) } else { $0.neverMentionTopics.remove(id) } } }))
+                        }
+                    }
+                }
+
+                if let bills = store.snapshot?.bills, !bills.isEmpty {
+                    SectionLabel("Bills")
+                    GlassCard {
+                        Caps("Smith knows names and due dates only, never amounts. Private bills are called \"a bill\".", size: 8, color: Theme.faint)
+                        ForEach(bills) { b in
+                            Toggle("Keep \(b.name) private", isOn: Binding(get: { s.privateBills.contains(b.id) },
+                                set: { on in store.updateSettings { if on { $0.privateBills.insert(b.id) } else { $0.privateBills.remove(b.id) } } }))
+                        }
+                    }
+                }
+            }
+            Group {
+                SectionLabel("Memory and concerns")
+                GlassCard {
+                    Toggle("Remember conversations as summaries", isOn: binding(\.memoryEnabled))
+                    Text("Smith may mention a concern at most once a week:").font(Theme.rounded(13)).foregroundStyle(Theme.dim)
+                    ForEach(Concern.Area.allCases, id: \.self) { area in
+                        Toggle(area.label, isOn: Binding(get: { !s.concerns.disabledAreas.contains(area) },
+                            set: { on in store.updateSettings { if on { $0.concerns.disabledAreas.remove(area) } else { $0.concerns.disabledAreas.insert(area) } } }))
+                    }
+                    Caps("Safety warnings can't be turned off.", size: 8, color: Theme.faint)
+                }
+
+                SectionLabel("Updates")
+                GlassCard {
+                    Picker("Tell me when data is behind", selection: binding(\.freshness.threshold)) {
+                        ForEach(Freshness.Threshold.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }
+                    Toggle("Export reminders", isOn: binding(\.freshness.exportReminders))
+                    Toggle("Sync reminders", isOn: binding(\.freshness.syncReminders))
+                    Toggle("iPad install reminders", isOn: binding(\.freshness.installReminders))
+                    if let exp = InstallInfo.expiration { Caps("This install expires \(exp.formatted(date: .abbreviated, time: .shortened))", size: 8, color: Theme.faint) }
+                }
+            }
+            henry
+            syncSection
+            heySmith
+            #if os(macOS)
+            macSection
+            #endif
+            Group {
+                SectionLabel("Erase")
+                Button("Erase everything Smith stores on this device") { confirmErase = true }.buttonStyle(.plain).foregroundStyle(Theme.rose)
+            }
+        }
+        .fileImporter(isPresented: $pickFolder, allowedContentTypes: [.folder]) { r in
+            if case .success(let url) = r, let b = Importer.bookmark(for: url) { store.updateLocalSettings { $0.watchedFolderBookmark = b } }
+        }
+        .fileExporter(isPresented: Binding(get: { exportingBackup != nil }, set: { if !$0 { exportingBackup = nil } }),
+                      document: exportingBackup, contentType: .smithData, defaultFilename: "Smith backup") { _ in exportingBackup = nil }
+        .alert("Erase everything?", isPresented: $confirmErase) {
+            Button("Erase", role: .destructive) { store.eraseAll(); app.brain.refreshHeadline() }
+            Button("Cancel", role: .cancel) {}
+        } message: { Text("Deletes Smith's data on this device: Chronicles data, journal summaries, what Smith knows about you, conversation summaries, letters and settings.") }
+    }
+
+    @ViewBuilder private var weatherCard: some View {
+        let s = app.store.settings
+        Picker("Weather for", selection: Binding(get: { s.weatherSource }, set: { v in
+            app.store.updateLocalSettings { $0.weatherSource = v }
+            Task { await app.weather.refresh(fahrenheit: s.fahrenheit, force: true) }
+        })) {
+            ForEach(WeatherSource.allCases, id: \.self) { Text($0.label).tag($0) }
+        }
+        switch s.weatherSource {
+        case .chronicles:
+            Text(s.chroniclesHome.map { "Home: \($0.name)" } ?? "No home city in Chronicles yet (Dashboard → World clocks: the first place is home). Using this device’s location meanwhile.")
+                .font(Theme.rounded(12)).foregroundStyle(Theme.dim)
+        case .city:
+            HStack {
+                TextField("", text: $cityQuery, prompt: Text(s.weatherCity?.name ?? "City, e.g. Portland, OR").foregroundStyle(Theme.faint))
+                    .textFieldStyle(.plain).onSubmit(findCity)
+                Button("Find", action: findCity).buttonStyle(.plain).foregroundStyle(Theme.violet)
+            }
+            if let c = cityStatus { Text(c).font(Theme.rounded(12)).foregroundStyle(Theme.dim) }
+        case .device:
+            Text("Uses this \(isMac ? "Mac" : "iPad")’s approximate location (you’ll be asked once).").font(Theme.rounded(12)).foregroundStyle(Theme.dim)
+        }
+        if let r = app.weather.report {
+            Text("\(app.weather.placeName ?? ""): \(r.line)").font(Theme.rounded(12)).foregroundStyle(Theme.teal)
+        } else if let p = app.weather.problem {
+            Text(p).font(Theme.rounded(12)).foregroundStyle(Theme.rose)
+        }
+        Caps("Only the place’s coordinates go to Open-Meteo, the free weather service Chronicles uses.", size: 8, color: Theme.faint)
+    }
+
+    private func findCity() {
+        let q = cityQuery.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return }
+        cityStatus = "Looking…"
+        Task {
+            do {
+                let place = try await OpenMeteo.findPlace(q)
+                app.store.updateLocalSettings { $0.weatherCity = place; $0.weatherSource = .city }
+                cityQuery = ""
+                cityStatus = "Weather for \(place.name)."
+                await app.weather.refresh(fahrenheit: app.store.settings.fahrenheit, force: true)
+            } catch {
+                cityStatus = "Couldn’t find “\(q)”. Try adding the state or country."
+            }
+        }
+    }
+
+    @ViewBuilder private var elevenCard: some View {
+        @Bindable var store = app.store
+        let s = store.settings
+        Toggle("Use ElevenLabs voices", isOn: Binding(get: { s.useElevenLabs }, set: { v in
+            store.updateSettings { $0.useElevenLabs = v }; app.applyVoiceSettings()
+            if v && elevenVoices.isEmpty { loadElevenVoices() }
+        }))
+        HStack {
+            SecureField("", text: $elevenKey, prompt: Text(hasElevenKey ? "Key saved ✓ — paste a new one to replace it" : "ElevenLabs API key").foregroundStyle(Theme.faint))
+                .textFieldStyle(.plain)
+                .onSubmit(saveElevenKey)
+            Button("Save", action: saveElevenKey).buttonStyle(.plain).foregroundStyle(Theme.violet)
+                .disabled(elevenKey.trimmingCharacters(in: .whitespaces).isEmpty)
+            if hasElevenKey {
+                Button("Remove") {
+                    ElevenLabs.apiKey = nil; hasElevenKey = false; elevenVoices = []; elevenStatus = "Key removed."
+                    store.updateSettings { $0.useElevenLabs = false }; app.applyVoiceSettings()
+                }.buttonStyle(.plain).foregroundStyle(Theme.dim)
+            }
+        }
+        if elevenLoading {
+            HStack(spacing: 8) { ProgressView().controlSize(.small); Text("Checking your key and loading your voices…").font(Theme.rounded(12)) }
+        } else if let st = elevenStatus {
+            Text(st).font(Theme.rounded(12)).foregroundStyle(Theme.teal)
+        }
+        if hasElevenKey && !elevenVoices.isEmpty {
+            elevenPicker("\(s.name)’s voice", selection: Binding(get: { s.elevenSmithVoice }, set: { v in
+                store.updateSettings { $0.elevenSmithVoice = v }; app.applyVoiceSettings() }),
+                sample: "Good morning. Here’s what’s on today.", model: s.elevenModel)
+            elevenPicker("Letters voice", selection: Binding(get: { s.elevenHenryVoice }, set: { v in
+                store.updateSettings { $0.elevenHenryVoice = v }; app.applyVoiceSettings() }),
+                sample: "My love, I’ve been thinking about you all day.", model: .v4)
+            Picker("Model", selection: Binding(get: { s.elevenModel }, set: { v in store.updateSettings { $0.elevenModel = v }; app.applyVoiceSettings() })) {
+                ForEach(ElevenLabs.Model.allCases, id: \.self) { Text($0.label).tag($0) }
+            }
+        } else if hasElevenKey && !elevenLoading {
+            Button("Load my voices") { loadElevenVoices() }.buttonStyle(.plain).foregroundStyle(Theme.violet)
+        }
+        if let e = elevenError ?? app.voice.lastVoiceError { Text(e).font(Theme.rounded(12)).foregroundStyle(Theme.rose) }
+        Caps("What \(s.name) says aloud (and a letter when you press Hear it) is sent to ElevenLabs to become speech. If it can’t be reached, the Apple voice speaks instead. The key is \(Keychain.storageDescription.lowercased()).", size: 8, color: Theme.faint)
+            .onAppear { if hasElevenKey && elevenVoices.isEmpty { loadElevenVoices(announce: false) } }
+    }
+
+    private func elevenPicker(_ title: String, selection: Binding<String?>, sample: String, model: ElevenLabs.Model) -> some View {
+        HStack {
+            Picker(title, selection: selection) {
+                Text("Apple voice").tag(String?.none)
+                ForEach(elevenVoices) { v in Text(v.detail.isEmpty ? v.name : "\(v.name) · \(v.detail)").tag(Optional(v.id)) }
+            }
+            Button {
+                if let id = selection.wrappedValue { app.voice.preview(.eleven(voice: id, model: model), text: sample) }
+            } label: { Image(systemName: "play.circle") }.buttonStyle(.plain).disabled(selection.wrappedValue == nil)
+        }
+    }
+
+    private func saveElevenKey() {
+        let key = elevenKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+        ElevenLabs.apiKey = key
+        elevenKey = ""
+        hasElevenKey = ElevenLabs.apiKey != nil
+        guard hasElevenKey else { elevenError = "That key couldn’t be saved on this device."; return }
+        loadElevenVoices(announce: true)
+    }
+
+    /// Checks the key by loading the voices. After a new key: switch ElevenLabs on,
+    /// give Smith and Henry a voice if they have none, and say hello in Smith's new voice.
+    private func loadElevenVoices(announce: Bool = false) {
+        guard let key = ElevenLabs.apiKey else { return }
+        elevenLoading = true; elevenError = nil; elevenStatus = nil
+        Task {
+            do {
+                let voices = try await ElevenLabs.voices(key: key)
+                elevenVoices = voices
+                if announce, let first = voices.first {
+                    let store = app.store
+                    store.updateSettings { s in
+                        s.useElevenLabs = true
+                        if s.elevenSmithVoice == nil || !voices.contains(where: { $0.id == s.elevenSmithVoice }) { s.elevenSmithVoice = first.id }
+                        if s.elevenHenryVoice == nil || !voices.contains(where: { $0.id == s.elevenHenryVoice }) {
+                            s.elevenHenryVoice = (voices.dropFirst().first ?? first).id
+                        }
+                    }
+                    app.applyVoiceSettings()
+                    let name = voices.first { $0.id == store.settings.elevenSmithVoice }?.name ?? first.name
+                    elevenStatus = "Key saved. \(voices.count) voices loaded — \(store.settings.name) now speaks as \(name). Pick another below."
+                    app.voice.preview(app.smithSpeaker, text: "Hello. This is my new voice. Pick another in Settings if you’d like.")
+                } else {
+                    elevenStatus = "\(voices.count) voices loaded."
+                }
+            } catch {
+                elevenError = error.localizedDescription
+            }
+            elevenLoading = false
+        }
+    }
+
+    @ViewBuilder private var chroniclesCard: some View {
+        let c = app.chronicles
+        let s = app.store.settings
+        if c.state == .notSetUp {
+            Text("Connect \(s.name) to your Chronicles account: your Chronicles password unlocks it, it reads your day live, and it can log meals, doses, habits, notes, tasks and bill payments for you.")
+                .font(Theme.rounded(13)).foregroundStyle(Theme.dim)
+            Button("Connect to Chronicles") { app.sheet = nil; c.beginSetup() }.buttonStyle(.plain).foregroundStyle(Theme.violet)
+        } else {
+            Text(s.chroniclesEmail ?? "").font(Theme.rounded(14))
+            Text(c.isUnlocked ? "Unlocked\(c.lastSync.map { " · synced \($0.formatted(date: .omitted, time: .shortened))" } ?? "")" : "Locked")
+                .font(Theme.rounded(12)).foregroundStyle(c.isUnlocked ? Theme.teal : Theme.dim)
+            if let e = c.lastError { Text(e).font(Theme.rounded(12)).foregroundStyle(Theme.rose) }
+            if c.isUnlocked {
+                HStack(spacing: 18) {
+                    Button(c.syncing ? "Syncing…" : "Sync now") { Task { await c.refresh() } }.disabled(c.syncing)
+                    Button("Lock now") { app.sheet = nil; c.lock() }
+                }.buttonStyle(.plain).foregroundStyle(Theme.violet)
+            }
+            if ChroniclesConnection.quickUnlockAvailable {
+                Toggle("Unlock with \(ChroniclesConnection.biometryName)", isOn: Binding(get: { s.quickUnlock }, set: { c.setQuickUnlock($0) }))
+                Caps("Locking then keeps your Chronicles session and seals it to this device’s Secure Enclave, so \(ChroniclesConnection.biometryName) can reopen it until it ends (2 hours idle, 7 days at most, or revoked in Chronicles). Off: locking ends the session and only your password unlocks.", size: 8, color: Theme.faint)
+            }
+            Picker("Lock after", selection: binding(\.autoLockMinutes)) {
+                Text("5 minutes idle").tag(5); Text("15 minutes idle").tag(15); Text("30 minutes idle").tag(30)
+                Text("2 hours idle").tag(120); Text("Only when I lock or quit").tag(0)
+            }
+            Button("Disconnect this device") { c.disconnect() }.buttonStyle(.plain).foregroundStyle(Theme.dim)
+        }
+        TextField("Server", text: Binding(get: { s.chroniclesServer ?? ChroniclesConnection.defaultServer },
+                                          set: { v in app.store.updateLocalSettings { $0.chroniclesServer = v == ChroniclesConnection.defaultServer ? nil : v } }))
+            .textFieldStyle(.plain).font(Theme.rounded(12)).foregroundStyle(Theme.dim)
+        Caps("Your password is never stored. The key stays in memory only while unlocked. What you keep from AI in Chronicles (Settings → In-App AI) is never sent here.", size: 8, color: Theme.faint)
+    }
+
+    private func binding<T>(_ path: WritableKeyPath<SmithSettings, T>) -> Binding<T> {
+        Binding(get: { app.store.settings[keyPath: path] }, set: { v in app.store.updateSettings { $0[keyPath: path] = v } })
+    }
+
+    private func voicePicker(_ title: String, selection: Binding<String?>, sample: String) -> some View {
+        HStack {
+            Picker(title, selection: selection) {
+                Text("Best available").tag(String?.none)
+                ForEach(VoiceIO.choosableVoices, id: \.identifier) { v in Text("\(v.name) (\(v.quality.label))").tag(Optional(v.identifier)) }
+            }
+            Button { app.voice.preview(.apple(selection.wrappedValue), text: sample) } label: { Image(systemName: "play.circle") }.buttonStyle(.plain)
+        }
+    }
+
+    @ViewBuilder private var henry: some View {
+        @Bindable var store = app.store
+        let h = store.settings.henry
+        SectionLabel("Letters")
+        GlassCard {
+            Text("Signed by").font(Theme.rounded(13, .medium))
+            TextField("", text: binding(\.henry.name), prompt: Text(store.settings.name).foregroundStyle(Theme.faint)).textFieldStyle(.plain)
+                .padding(8).background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+            Text("Leave blank to have \(store.settings.name) write them, or give any name you like.").font(Theme.rounded(11)).foregroundStyle(Theme.dim)
+            Text("Who they are").font(Theme.rounded(13, .medium))
+            TextField("", text: binding(\.henry.description), prompt: Text("Their voice, how they speak to you, your history together, pet names, what they admire in you, what they'd never say…").foregroundStyle(Theme.faint), axis: .vertical)
+                .textFieldStyle(.plain).lineLimit(3...12).padding(8).background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+            HStack { Text("Playful").font(Theme.rounded(12)); Slider(value: binding(\.henry.romance)); Text("Romantic").font(Theme.rounded(12)) }
+            HStack { Text("Plain").font(Theme.rounded(12)); Slider(value: binding(\.henry.poetry)); Text("Poetic").font(Theme.rounded(12)) }
+            Picker("Length", selection: binding(\.henry.length)) {
+                Text("A note").tag(HenryPersona.Length.note); Text("A letter").tag(HenryPersona.Length.letter); Text("A long letter").tag(HenryPersona.Length.longLetter)
+            }.pickerStyle(.segmented)
+            Text("Sample letters").font(Theme.rounded(13, .medium))
+            ForEach(Array(h.samples.enumerated()), id: \.offset) { i, sample in
+                HStack(alignment: .top) {
+                    Text(sample).font(.system(size: 12, design: .serif)).lineLimit(3)
+                    Spacer()
+                    Button { store.updateSettings { $0.henry.samples.remove(at: i) } } label: { Image(systemName: "minus.circle") }.buttonStyle(.plain)
+                }
+            }
+            HStack {
+                TextField("", text: $newSample, prompt: Text("Paste a sample letter").foregroundStyle(Theme.faint), axis: .vertical).textFieldStyle(.plain)
+                Button("Add") { guard !newSample.isEmpty else { return }; store.updateSettings { $0.henry.samples.append(newSample) }; newSample = "" }.buttonStyle(.plain).foregroundStyle(Theme.violet)
+            }
+            Toggle("Draw on my day (goals and the general journal summary only)", isOn: binding(\.henry.drawOnMyDay))
+            Toggle(h.name.isEmpty ? "Use what \(store.settings.name) knows about me" : "Let \(store.settings.letterName) use what \(store.settings.name) knows about me", isOn: Binding(get: { store.aboutYou.shareWithHenry }, set: { store.aboutYou.shareWithHenry = $0 }))
+            voicePicker("Letters voice", selection: Binding(get: { store.settings.henryVoiceID }, set: { v in store.updateLocalSettings { $0.henryVoiceID = v } }),
+                        sample: "My love, I've been thinking about you all day.")
+        }
+    }
+
+    @ViewBuilder private var syncSection: some View {
+        SectionLabel("Sync with \(isMac ? "iPad" : "Mac")")
+        GlassCard {
+            switch app.sync.status {
+            case .waitingForPair(let code):
+                Text("On your Mac, open Settings → Sync and enter:").font(Theme.rounded(13))
+                Text(code).font(.system(size: 40, weight: .light, design: .monospaced)).tracking(6)
+                Button("Cancel") { app.sync.cancelPairing() }.buttonStyle(.plain).foregroundStyle(Theme.dim)
+            default:
+                if let p = app.sync.peerName { Text("Nearby: \(p)").font(Theme.rounded(13)).foregroundStyle(Theme.dim) }
+                if app.sync.isPaired {
+                    Button("Sync now") { Task { await app.sync.syncNow() } }.buttonStyle(.plain).foregroundStyle(Theme.violet)
+                    if let last = app.store.lastSync { Caps("Last synced \(last.formatted(date: .abbreviated, time: .shortened))", size: 8, color: Theme.faint) }
+                    Button("Export Smith data (backup file)…") {
+                        if let d = try? app.store.exportBackup() { exportingBackup = SmithDataDocument(data: d) }
+                    }.buttonStyle(.plain).foregroundStyle(Theme.violet)
+                    Button("Unpair") { app.sync.unpair() }.buttonStyle(.plain).foregroundStyle(Theme.dim)
+                } else if isMac {
+                    Text("On the iPad, open Settings → Sync → Pair. Then enter the code it shows:").font(Theme.rounded(13))
+                    HStack {
+                        TextField("123456", text: $pairCode).textFieldStyle(.plain).font(.system(size: 22, design: .monospaced))
+                        Button("Pair") { Task { await app.sync.pair(code: pairCode) } }.buttonStyle(.plain).foregroundStyle(Theme.violet)
+                    }
+                } else {
+                    Button("Pair with my Mac") { app.sync.beginPairing() }.buttonStyle(.plain).foregroundStyle(Theme.violet)
+                }
+            }
+            switch app.sync.status {
+            case .syncing: ProgressView().controlSize(.small)
+            case .done(let m): Text(m).font(Theme.rounded(12)).foregroundStyle(Theme.teal)
+            case .failed(let m): Text(m).font(Theme.rounded(12)).foregroundStyle(Theme.rose)
+            default: EmptyView()
+            }
+            Caps("Directly between your devices on your own network. Your API key and the conversation in progress never sync.", size: 8, color: Theme.faint)
+        }
+    }
+
+    @ViewBuilder private var heySmith: some View {
+        SectionLabel("\"Hey Smith\"")
+        GlassCard {
+            Text("Use Vocal Shortcuts so \"Hey Smith\" works even when Smith is closed:").font(Theme.rounded(13))
+            Text("1. Open Accessibility → Vocal Shortcuts.\n2. Add Action → choose the shortcut \"Talk to Smith\".\n3. Type \"Hey Smith\" and say it three times.")
+                .font(Theme.rounded(13)).foregroundStyle(Theme.dim)
+            Button("Open Accessibility settings") { openVocalShortcuts() }.buttonStyle(.plain).foregroundStyle(Theme.violet)
+            Caps("You can also say \"Hey Siri, ask Smith …\" in one go.", size: 8, color: Theme.faint)
+        }
+    }
+
+    #if os(macOS)
+    @ViewBuilder private var macSection: some View {
+        SectionLabel("Mac")
+        GlassCard {
+            Toggle("Start at login", isOn: Binding(get: { LoginItem.isEnabled }, set: { LoginItem.set($0) }))
+            Toggle("Greet me on the first wake of the day", isOn: binding(\.greetOnWake))
+            Toggle("Listen for \"Hey Smith\" while in the menu bar", isOn: Binding(get: { app.store.settings.macWakeWord }, set: { on in
+                app.store.updateLocalSettings { $0.macWakeWord = on }
+                if on { WakeWordListener.shared.start() } else { WakeWordListener.shared.stop() }
+            }))
+            Caps("Listening happens on this Mac; nothing is sent until you say \"Hey Smith\". The microphone light stays on while it's enabled.", size: 8, color: Theme.faint)
+            Caps("Shortcut: ⌥Space opens Smith from anywhere.", size: 8, color: Theme.faint)
+        }
+    }
+    #endif
+
+    private var isMac: Bool {
+        #if os(macOS)
+        true
+        #else
+        false
+        #endif
+    }
+
+    private func openVocalShortcuts() {
+        #if os(macOS)
+        if let u = URL(string: "x-apple.systempreferences:com.apple.Accessibility-Settings.extension") { NSWorkspace.shared.open(u) }
+        #else
+        if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) }
+        #endif
+    }
+}
+
+nonisolated extension UTType {
+    static let smithData = UTType(exportedAs: "com.fastandcurious.smith.smithdata")
+}
+
+nonisolated struct SmithDataDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.smithData] }
+    var data: Data
+    init(data: Data) { self.data = data }
+    init(configuration: ReadConfiguration) throws { data = configuration.file.regularFileContents ?? Data() }
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper { FileWrapper(regularFileWithContents: data) }
+}
