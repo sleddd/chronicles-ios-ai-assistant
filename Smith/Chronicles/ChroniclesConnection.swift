@@ -54,8 +54,18 @@ final class ChroniclesConnection {
                            writer: { [unowned self] in
                                if let session = self.session, let client = self.client { ChroniclesWriter(client: client, session: session) } else { nil }
                            },
-                           account: { [unowned self] in self.isUnlocked ? self.store.settings.chroniclesEmail : nil })
+                           account: { [unowned self] in self.isUnlocked ? self.store.settings.chroniclesEmail : nil },
+                           takenTopicIDs: { [unowned self] in await self.sync?.knownTopicIDs() ?? [] })
     }
+
+    /// Called whenever Smith locks, so whatever is under way elsewhere (a reply, speech) stops too.
+    @ObservationIgnored var onLock: (() -> Void)?
+    /// The writer for the session as it is right now (nil once locked).
+    private var liveWriter: ChroniclesWriter? {
+        if let session, let client { ChroniclesWriter(client: client, session: session) } else { nil }
+    }
+    /// Wellness check-ins made this session that the sync hasn't brought back yet, by day.
+    @ObservationIgnored private var newWellness: [String: Int] = [:]
 
     /// The store was loaded after launch (it couldn't be read then): the account may be known after all.
     func storeLoaded() {
@@ -116,7 +126,11 @@ final class ChroniclesConnection {
     private func opened(_ s: ChroniclesSession, client c: ChroniclesClient) async {
         session = s
         client = c
-        sync = ChroniclesLiveSync(client: c, session: s)
+        let sameAccount = store.settings.chroniclesPrivacyAccount == s.email
+        sync = ChroniclesLiveSync(client: c, session: s, rememberedPrivacy: sameAccount ? store.settings.chroniclesPrivacy : nil,
+                                  aiConfigRev: sameAccount ? store.settings.chroniclesAIConfigRev : 0)
+        // What Smith saved for this account opens now, and only now
+        store.openVault(s.vaultKey)
         store.updateLocalSettings { $0.chroniclesEmail = s.email }
         state = .unlocked
         if store.settings.quickUnlock { saveQuickUnlock(s) }
@@ -136,7 +150,10 @@ final class ChroniclesConnection {
             Self.forgetQuickUnlock()
         }
         session = nil; sync = nil; pending = nil
+        newWellness = [:]; failedRefreshes = 0
+        onLock?()
         cloud.signedOut()
+        store.closeVault()
         undoables = []
         APIKeys.setChroniclesKey(nil)
         if state != .notSetUp { state = .locked }
@@ -233,21 +250,26 @@ final class ChroniclesConnection {
         let name = store.settings.name
         // The system prompt blocks until answered: off the main thread
         let file = Self.quickUnlockFile
+        // The fingerprint or face is asked for here, where a cancel is plainly a cancel
+        // (the Secure Enclave reports every failure alike). Cancelled or not recognised:
+        // the copy is kept, to try again. Only a copy that then won't open is forgotten.
+        let context = LAContext()
+        context.localizedFallbackTitle = ""
+        guard (try? await context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: "Unlock \(name)")) == true else {
+            state = .locked
+            return
+        }
         let attempt = await Task.detached { () -> Result<Data?, Error> in
-            Result { try SecureEnclaveVault.load(name: file, lock: .presence, reason: "Unlock \(name)") }
+            Result { try SecureEnclaveVault.load(name: file, lock: .presence, reason: "Unlock \(name)", context: context) }
         }.value
         let opened: Data?
         switch attempt {
         case .success(let d): opened = d
-        case .failure(let error):
+        case .failure:
             opened = nil
-            // Cancelled: try again whenever. Anything else (a new fingerprint was enrolled,
-            // or the copy was sealed under the older rule): the copy is no use any more
-            let cancelled = [LAError.userCancel, .appCancel, .systemCancel].contains { (error as? LAError)?.code == $0 }
-            if !cancelled {
-                Self.forgetQuickUnlock()
-                lastError = "Unlock with your password this once; \(Self.biometryName) will work again after that."
-            }
+            // A new fingerprint was enrolled, or the copy was sealed under the older rule
+            Self.forgetQuickUnlock()
+            lastError = "Unlock with your password this once; \(Self.biometryName) will work again after that."
         }
         guard let data = opened, let v = try? JSONValue.parse(data), let email = v["email"]?.string, let token = v["token"]?.string,
               let keyText = v["key"]?.string, let keyData = Data(base64Encoded: keyText) else {
@@ -283,6 +305,9 @@ final class ChroniclesConnection {
                 guard let self, !Task.isCancelled else { return }
                 self.checkAutoLock()
                 guard self.state == .unlocked, !self.syncing, let sync = self.sync else { continue }
+                // After a failure (offline, the day's limit): 1 minute, then 2, 4, up to 10
+                if self.failedRefreshes > 0,
+                   Date().timeIntervalSince(self.lastAttempt) < min(600, 30 * pow(2, Double(min(self.failedRefreshes, 6)))) { continue }
                 let every: TimeInterval = self.rekeying ? 2 * 60 : 5 * 60
                 var due = Date().timeIntervalSince(self.lastSync ?? .distantPast) > every
                 if !due && !self.rekeying { due = await sync.hasChanges() }
@@ -319,6 +344,7 @@ final class ChroniclesConnection {
             if refreshAgain { refreshAgain = false; Task { await self.refresh() } }
         }
         syncing = true
+        lastAttempt = Date()
         defer { syncing = false }
         do {
             let r = try await sync.refresh()
@@ -326,6 +352,12 @@ final class ChroniclesConnection {
             // Otherwise the account's Anthropic key would be put back in memory after the lock.
             guard self.sync === sync, state == .unlocked else { return }
             hiddenTopicIDs = r.hiddenTopicIDs
+            if let p = r.sealedPrivacy, p != store.settings.chroniclesPrivacy || store.settings.chroniclesPrivacyAccount != store.settings.chroniclesEmail {
+                store.updateLocalSettings { $0.chroniclesPrivacy = p; $0.chroniclesPrivacyAccount = $0.chroniclesEmail }
+            }
+            if r.aiConfigRev != store.settings.chroniclesAIConfigRev {
+                store.updateLocalSettings { $0.chroniclesAIConfigRev = r.aiConfigRev }
+            }
             // The account's own Anthropic key (Chronicles → In-App AI), in memory while unlocked
             APIKeys.setChroniclesKey(r.anthropicKey)
             // Chronicles' home city, for the weather (kept, so it still works while locked)
@@ -345,6 +377,7 @@ final class ChroniclesConnection {
             lastSync = Date()
             lastError = nil
             rekeying = false
+            failedRefreshes = 0
         } catch ChroniclesError.rekeying(let m) {
             // Chronicles is moving to a new key: keep what Smith has, try again in a while.
             // When it's done, the key in memory won't open the journal (caught below)
@@ -363,8 +396,13 @@ final class ChroniclesConnection {
             lock()
         } catch {
             lastError = error.localizedDescription
+            failedRefreshes += 1
         }
     }
+
+    /// Failed syncs in a row: each makes the loop wait longer before it tries again.
+    @ObservationIgnored private var failedRefreshes = 0
+    @ObservationIgnored private var lastAttempt = Date.distantPast
 
     // MARK: actions
 
@@ -372,8 +410,10 @@ final class ChroniclesConnection {
         let session = self.session, client = self.client, sync = self.sync
         let store = self.store
         let hidden = hiddenTopicIDs
+        _ = (session, client)
         var ctx = ChroniclesActionContext(
-            writer: { if let session, let client { ChroniclesWriter(client: client, session: session) } else { nil } },
+            // Asked afresh each time: after a lock there is no writer, even for a reply already under way
+            writer: { [weak self] in await MainActor.run { self?.liveWriter } },
             snapshot: { await MainActor.run { store.snapshot } },
             topicID: { names in await sync?.topicID(named: names) },
             hiddenTopicIDs: { hidden },
@@ -389,7 +429,11 @@ final class ChroniclesConnection {
             })
         ctx.medication = { id in await sync?.medication(id) }
         ctx.hasDoseLink = { key in await sync?.hasDoseLink(key) ?? false }
-        ctx.wellnessEntryID = { day in await sync?.wellnessEntryID(day: day) }
+        ctx.wellnessEntryID = { [weak self] day in
+            if let id = await sync?.wellnessEntryID(day: day) { return id }
+            return await MainActor.run { self?.newWellness[day] }
+        }
+        ctx.noteWellnessEntry = { [weak self] day, id in await MainActor.run { self?.newWellness[day] = id } }
         return ctx
     }
 

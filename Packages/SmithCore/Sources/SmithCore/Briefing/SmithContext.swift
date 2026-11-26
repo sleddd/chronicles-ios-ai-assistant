@@ -37,6 +37,14 @@ public struct SmithContext: Sendable {
     /// System blocks, most stable first so the cache prefix holds: persona,
     /// then what Smith knows about them, then today's facts.
     public func systemBlocks(spoken: Bool) -> [SystemBlock] {
+        stableBlocks(spoken: spoken) + [SystemBlock(dayText(), cache: true)]
+    }
+
+    /// The part that stays the same for a whole conversation: persona, and what Smith
+    /// knows about them. A live chat sends exactly these every turn (the clock and the
+    /// day's facts go in the messages instead), so the prefix stays cached and the
+    /// model's earlier reasoning, which is tied to the system prompt, stays valid.
+    public func stableBlocks(spoken: Bool) -> [SystemBlock] {
         var persona = PersonaPrompt.system(name: name, spoken: spoken)
         if canAct { persona += "\n\n" + ChroniclesActionTools.persona }
         persona += "\n\n" + ChatSafety.baseline
@@ -49,8 +57,6 @@ public struct SmithContext: Sendable {
         }
         if !memory.isEmpty { blocks.append(SystemBlock(memory.joined(separator: "\n\n"))) }
         blocks[blocks.count - 1].cache = true
-
-        blocks.append(SystemBlock(dayText(), cache: true))
         return blocks
     }
 

@@ -119,6 +119,14 @@ nonisolated enum Keychain {
             return k
         }
     }
+    /// "Erase everything": the storage key goes too, so a key that can no longer be
+    /// opened (the app's data came from another device, say) doesn't block a fresh start.
+    static func resetStorageKey() {
+        storageKeyLock.withLock {
+            cachedStorageKey = nil
+            _ = set(nil, for: "storage-key")
+        }
+    }
     private static let storageKeyLock = NSLock()
     nonisolated(unsafe) private static var cachedStorageKey: SymmetricKey?
 
@@ -151,13 +159,48 @@ nonisolated enum EncryptedFile {
         raw(name).flatMap { Tolerant.decode(T.self, from: $0, defaults: defaults) }
     }
 
-    static func raw(_ name: String) -> Data? {
-        let url = folder.appendingPathComponent(name)
-        guard let key = Keychain.storageKey, let sealed = try? Data(contentsOf: url),
-              let box = try? AES.GCM.SealedBox(combined: sealed),
-              let plain = try? AES.GCM.open(box, using: key) else { return nil }
-        return plain
+    // Two keys.
+    //  - Settings (what the unlock screen needs: the account's email, the server, the
+    //    lock timer) are sealed under the device's storage key.
+    //  - Everything personal (the day's picture, journal summaries, memories, letters,
+    //    conversation summaries) is sealed under the vault key, which is made from the
+    //    Chronicles master key and exists only while Smith is unlocked. A locked Smith
+    //    cannot open these files, and neither can anything else on an unlocked device.
+
+    static let personalFiles: Set<String> = ["chronicles.smith", "journal-vault.smith", "about-you.smith",
+                                             "conversations.smith", "letters.smith", "smith-cloud.smith"]
+    private static let vaultLock = NSLock()
+    nonisolated(unsafe) private static var vault: SymmetricKey?
+
+    /// Set at unlock, cleared at lock.
+    static func setVaultKey(_ key: SymmetricKey?) { vaultLock.withLock { vault = key } }
+    static var vaultIsOpen: Bool { vaultLock.withLock { vault != nil } }
+
+    private static func key(for name: String) -> SymmetricKey? {
+        personalFiles.contains(name) ? vaultLock.withLock { vault } : Keychain.storageKey
     }
+
+    private static func open(_ sealed: Data, _ key: SymmetricKey?) -> Data? {
+        guard let key, let box = try? AES.GCM.SealedBox(combined: sealed) else { return nil }
+        return try? AES.GCM.open(box, using: key)
+    }
+
+    static func raw(_ name: String) -> Data? {
+        guard let sealed = try? Data(contentsOf: folder.appendingPathComponent(name)) else { return nil }
+        if let plain = open(sealed, key(for: name)) { return plain }
+        // A personal file from before the vault key: still under the device key. Read
+        // once (only while unlocked) and saved again under the vault key by the caller.
+        if personalFiles.contains(name), vaultIsOpen, let plain = open(sealed, Keychain.storageKey) {
+            legacyLock.withLock { _ = legacyRead.insert(name) }
+            return plain
+        }
+        return nil
+    }
+
+    private static let legacyLock = NSLock()
+    nonisolated(unsafe) private static var legacyRead: Set<String> = []
+    /// Personal files just read under the old device key (and so due to be saved again).
+    static func takeLegacyReads() -> Set<String> { legacyLock.withLock { let r = legacyRead; legacyRead = []; return r } }
 
     /// False while the storage key can't be read: nothing can be opened, and nothing may be saved.
     static var isAvailable: Bool { Keychain.storageKey != nil }
@@ -171,7 +214,11 @@ nonisolated enum EncryptedFile {
 
     @discardableResult
     static func write<T: Encodable>(_ value: T, _ name: String) -> Bool {
-        guard let key = Keychain.storageKey else { lastWriteError = "Smith’s storage key can’t be read right now."; return false }
+        guard let key = key(for: name) else {
+            // Locked: nothing personal is written (there is nothing of it in memory to write)
+            if !personalFiles.contains(name) { lastWriteError = "Smith’s storage key can’t be read right now." }
+            return false
+        }
         do {
             let plain = try JSONEncoder().encode(value)
             guard let sealed = try AES.GCM.seal(plain, using: key).combined else { return false }

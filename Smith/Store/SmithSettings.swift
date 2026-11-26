@@ -31,6 +31,12 @@ struct SmithSettings: Codable, Equatable {
     var weatherCity: HomePlace?
     /// The home city last read from Chronicles (so the weather still works while locked).
     var chroniclesHome: HomePlace?
+    /// The account's sealed "Don't share with AI" choices as last opened, and whose they
+    /// are. Kept so that a server which stops sending them can't make Smith forget them.
+    var chroniclesPrivacy: JSONValue?
+    var chroniclesPrivacyAccount: String?
+    /// The highest revision seen of the account's AI key setting (an older one is a replay).
+    var chroniclesAIConfigRev: Double = 0
 
     var journalMode: JournalShareMode = .general
     /// Chronicles topic ids never mentioned (left out of the journal digest).

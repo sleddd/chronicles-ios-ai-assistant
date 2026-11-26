@@ -93,6 +93,7 @@ final class VoiceIO: NSObject {
         engine.prepare()
         do { try engine.start() } catch { permissionProblem = "Couldn't start the microphone."; return }
         state = .listening
+        listenStarted = Date()
         startPiece()
         restartSilenceTimer(initial: true)
     }
@@ -422,6 +423,10 @@ final class VoiceIO: NSObject {
     /// "finished" that arrives late, for speech already stopped, is not counted
     /// against whatever is being said now.
     private var liveUtterances: Set<ObjectIdentifier> = []
+    /// The same for ElevenLabs audio: players started and not yet finished or stopped.
+    private var livePlayers: Set<ObjectIdentifier> = []
+    /// When listening last began (a microphone change in its first moment is the start itself).
+    private var listenStarted = Date.distantPast
 
     private func playNext() {
         guard player?.isPlaying != true, !audioQueue.isEmpty else { return }
@@ -434,12 +439,13 @@ final class VoiceIO: NSObject {
         p.enableRate = true
         p.rate = 0.85 + rate * 0.3
         player = p
+        livePlayers.insert(ObjectIdentifier(p))
         let ok = p.play()
         note("play \(ok) duration \(p.duration)")
         preparing = false
         // Couldn't play (the audio route went away, a call came in): no "finished" will
         // ever arrive, so move on now rather than stay "speaking" for good
-        guard ok else { elevenPieceEnded(); return }
+        guard ok else { livePlayers.remove(ObjectIdentifier(p)); elevenPieceEnded(); return }
         meterTimer?.invalidate()
         meterTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -479,6 +485,7 @@ final class VoiceIO: NSObject {
         (waiting + audioQueue.flatMap(\.shows) + appleShows.values.flatMap { $0 }).forEach { $0.fire() }
         appleShows = [:]
         liveUtterances = []
+        livePlayers = []
         audioQueue = []
         elevenFetching = false
         spokenSoFar = ""
@@ -511,15 +518,18 @@ final class VoiceIO: NSObject {
         center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
             let began = (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) == AVAudioSession.InterruptionType.began.rawValue
             guard began else { return }
-            MainActor.assumeIsolated { self?.stopSpeaking(); self?.cancelListening() }
+            // What they had said so far is kept and sent, not thrown away
+            MainActor.assumeIsolated { self?.stopSpeaking(); self?.finishListening() }
         }
         #endif
         center.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
                 // The input changed mid-sentence: the tap's format is stale, so listening ends here
-                guard let self, self.state == .listening else { return }
-                self.cancelListening()
-                self.permissionProblem = "The microphone changed. Tap to talk again."
+                // Starting to listen changes the audio route by itself (headphones switching
+                // to their microphone): that first moment is not a change to act on.
+                guard let self, self.state == .listening, Date().timeIntervalSince(self.listenStarted) > 2 else { return }
+                // Later: the tap no longer matches the input, so listening ends, with what was heard kept
+                self.finishListening()
             }
         }
     }
@@ -620,15 +630,18 @@ extension VoiceIO: AVAudioPlayerDelegate {
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         let key = ObjectIdentifier(player)
         Task { @MainActor in
-            guard self.player.map(ObjectIdentifier.init) == key else { return }
-            self.note("finished \(flag)"); self.elevenPieceEnded()
+            // Stopped since: says nothing. Finished but already replaced by the next piece: still counted
+            guard self.livePlayers.remove(key) != nil else { return }
+            self.note("finished \(flag)")
+            if self.player.map(ObjectIdentifier.init) == key { self.elevenPieceEnded() } else { self.utteranceEnded() }
         }
     }
     nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
         let key = ObjectIdentifier(player)
         Task { @MainActor in
-            guard self.player.map(ObjectIdentifier.init) == key else { return }
-            self.note("decode error \(String(describing: error))"); self.elevenPieceEnded()
+            guard self.livePlayers.remove(key) != nil else { return }
+            self.note("decode error \(String(describing: error))")
+            if self.player.map(ObjectIdentifier.init) == key { self.elevenPieceEnded() } else { self.utteranceEnded() }
         }
     }
 }

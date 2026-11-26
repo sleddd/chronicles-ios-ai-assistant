@@ -15,6 +15,15 @@ import Testing
         #expect(ExportParser.idString(.number(12)) == "12")
     }
 
+    @Test func aDateIsARealMonthAndDay() {
+        #expect(Day.parse("2026-11-00") == nil)
+        #expect(Day.parse("2026-13-01") == nil)
+        #expect(Day.parse("2026-11-30")?.d == 30)
+        // The habit log is left alone rather than indexed at -1
+        let log: JSONValue = ["7": ["2026-11": "01"]]
+        #expect(ChroniclesWriter.incrementHabit(log, habitID: 7, day: "2026-11-00", by: 1) == log)
+    }
+
     @Test func aHugeRepeatIntervalIsClamped() {
         let rule = RepeatRule(fields: ["repeat": "daily", "repeatEvery": 1e30])
         #expect(rule?.every == 99)

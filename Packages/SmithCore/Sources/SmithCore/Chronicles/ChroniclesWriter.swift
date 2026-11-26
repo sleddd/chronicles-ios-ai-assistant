@@ -72,9 +72,12 @@ public struct ChroniclesWriter: Sendable {
 
     /// Creates one of Smith's topics, sealed the way Chronicles seals topics
     /// (reserve an id, seal {name, icon} to it, then create). Returns its id.
-    public func createTopic(named name: String) async throws -> Int {
+    /// `taken`: topic ids already in use. The name is sealed to whatever id the server
+    /// reserves; were that the Journal topic's id, the journal would become "Smith memories".
+    public func createTopic(named name: String, taken: Set<Int> = []) async throws -> Int {
         let ids = try await client.call("POST", "/api/topics/ids", ["count": 1], session).body["ids"]?.array ?? []
         guard let id = ids.first?.int else { throw ChroniclesError.server(500, "No topic id") }
+        guard id >= 1, !taken.contains(id) else { throw ChroniclesError.server(500, "Chronicles offered a topic id that is already in use") }
         let sealed = try ChroniclesCrypto.sealRecord(kind: ChroniclesCrypto.RecordKind.topic, id: ChroniclesCrypto.topicRecordID(id),
                                                      record: ["name": .string(name), "icon": .null], key: session.key)
         let answer = try await client.call("POST", "/api/topics", [
@@ -126,13 +129,14 @@ public struct ChroniclesWriter: Sendable {
     public func updateSmithRecord(entryID: Int, _ record: SmithRecord, topicID: Int, theirs: Bool = false) async throws {
         let e = record.entry(topicID: topicID)
         _ = try await updateEntry(id: entryID) { content, meta in
-            content = e.content
             if theirs {
+                if SmithRecord.text(fromHTML: content) != record.text { content = e.content }
                 var cf = meta["_customFields"]?.object ?? [:]
                 for (k, v) in e.metadata["_customFields"]?.object ?? [:] where k != "smithKind" && k != "smithId" { cf[k] = v }
                 meta["_customFields"] = .object(cf)
                 return
             }
+            content = e.content
             // Keep whatever else Chronicles stored on the entry; replace Smith's fields
             meta["_taxonomyId"] = .number(Double(topicID))
             meta["_customFields"] = e.metadata["_customFields"]
@@ -222,7 +226,7 @@ public struct ChroniclesWriter: Sendable {
     }
 
     static func incrementHabit(_ log: JSONValue, habitID: Int, day: String, by delta: Int) -> JSONValue {
-        guard let (_, _, d) = Day.parse(day) else { return log }
+        guard let (_, _, d) = Day.parse(day), (1...31).contains(d) else { return log }
         var all = log.object ?? [:]
         var months = all[String(habitID)]?.object ?? [:]
         let month = String(day.prefix(7))
@@ -265,7 +269,10 @@ public struct ChroniclesWriter: Sendable {
     /// One bill, read afresh and opened; the list comes in pages, so every page is looked through.
     func billRecord(_ billID: String) async throws -> [String: JSONValue]? {
         var offset = 0
+        var pages = 0
         while true {
+            pages += 1
+            guard pages <= ChroniclesClient.maxPages else { return nil }
             let r = try await client.call("GET", "/api/finance/bills?v=2&offset=\(offset)", nil, session)
             let rows = r.body["records"]?.array ?? []
             if let row = rows.first(where: { $0["id"]?.string == billID }), let p = row["payload"]?.string, let iv = row["iv"]?.string {

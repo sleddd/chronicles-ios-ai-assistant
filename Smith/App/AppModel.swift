@@ -65,6 +65,7 @@ final class AppModel {
             }
         }
         applyVoiceSettings()
+        chronicles.onLock = { [unowned self] in self.brain.lockedOut() }
         store.onLoaded = { [unowned self] in
             self.chronicles.storeLoaded()
             self.applyVoiceSettings()
@@ -110,6 +111,10 @@ final class AppModel {
     func becameActive() async {
         // Started while the device was locked (Siri, say): the files can be read now
         store.loadIfNeeded()
+        // Still not loaded with the device unlocked and in front: the saved data can't be opened here
+        if !store.loaded, importMessage == nil {
+            importMessage = "Smith can’t open what it saved on this device, so nothing new will be kept. To start afresh, use Settings → Erase everything."
+        }
         brain.refreshHeadline()
         // (Mac ↔ iPad now share memories and letters through Chronicles; the local-network sync is retired)
         chronicles.checkAutoLock()
@@ -175,7 +180,11 @@ final class AppModel {
         showChat = true
         await brain.send(t, spoken: true)
         if brain.conversationMode {
-            voice.whenDoneSpeaking { [weak self] in self?.listenOnce() }
+            voice.whenDoneSpeaking { [weak self] in
+                // Already listening (they cut in), or another reply is on its way: leave it be
+                guard let self, self.voice.state != .listening, !self.brain.isThinking else { return }
+                self.listenOnce()
+            }
         }
     }
 
@@ -192,11 +201,22 @@ final class AppModel {
         Task { await brain.send(text, spoken: false) }
     }
 
-    /// Esc / Stop: stop listening (nothing is sent), stop speaking, and stop an
-    /// answer in progress — your message comes back to the typing box.
+    /// Esc / Stop: stop listening (nothing is sent; what was heard stays in the typing
+    /// box), stop speaking, and stop an answer in progress — your message comes back to the box.
     func stopAll() {
         dictateIntoBox = false
-        if let taken = brain.stop() { draft = taken }
+        // Stopped while they were talking: what was transcribed so far stays in the box,
+        // after anything already typed there. It is theirs to edit, send or clear.
+        let said = voice.state == .listening ? voice.partialTranscript.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+        let taken = brain.stop()
+        if !said.isEmpty {
+            let typed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+            draft = typed.isEmpty ? said : typed + " " + said
+            return
+        }
+        // Stopped while Smith was answering or speaking: the message comes back to the
+        // box, unless they've already started typing something else
+        if let taken, draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { draft = taken }
     }
 
     /// Edit: your latest message (and Smith's answer) taken back into the typing box.

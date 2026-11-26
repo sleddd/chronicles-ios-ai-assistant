@@ -41,6 +41,16 @@ final class SmithStore {
 
     init() { load() }
 
+    /// Chronicles' copy of the memories, letters and summaries is now this device's:
+    /// the files that couldn't be opened are written afresh, and ordinary syncing resumes.
+    func smithRecordsRecovered() {
+        guard smithRecordsUnreadable, loaded else { return }
+        smithRecordsUnreadable = false
+        save(aboutYou, "about-you.smith")
+        save(Records(items: conversations, tombstones: conversationTombstones), "conversations.smith")
+        save(Records(items: letters, tombstones: letterTombstones), "letters.smith")
+    }
+
     /// Called when the app comes forward: loads what couldn't be read at launch.
     func loadIfNeeded() {
         guard !loaded, EncryptedFile.isAvailable else { return }
@@ -54,6 +64,19 @@ final class SmithStore {
         // `save` does nothing) or sent to Chronicles from here
         applyingFromChronicles = true
         defer { applyingFromChronicles = false; loaded = true }
+        settings = EncryptedFile.read(SmithSettings.self, "settings.smith", defaults: SmithSettings()) ?? SmithSettings()
+        lastSync = UserDefaults.standard.object(forKey: "lastSync") as? Date
+        // Everything personal waits for Smith to be unlocked (`openVault`)
+    }
+
+    /// Smith was unlocked: the personal files can be opened now. They are sealed under
+    /// a key made from the Chronicles master key, which exists only while unlocked.
+    func openVault(_ key: SymmetricKey) {
+        EncryptedFile.setVaultKey(key)
+        let wasLoaded = loaded
+        loaded = false   // loading is not a change: nothing is saved back from here
+        applyingFromChronicles = true
+        defer { applyingFromChronicles = false; loaded = wasLoaded; resealLegacyFiles() }
         let about = EncryptedFile.read(AboutYouStore.self, "about-you.smith", defaults: AboutYouStore())
         smithRecordsUnreadable = (about == nil && EncryptedFile.exists("about-you.smith"))
             || (EncryptedFile.exists("conversations.smith") && EncryptedFile.raw("conversations.smith") == nil)
@@ -65,9 +88,32 @@ final class SmithStore {
         conversations = convs?.items ?? []; conversationTombstones = convs?.tombstones ?? []
         let lets = EncryptedFile.read(Records<Letter>.self, "letters.smith")
         letters = lets?.items ?? []; letterTombstones = lets?.tombstones ?? []
-        settings = EncryptedFile.read(SmithSettings.self, "settings.smith", defaults: SmithSettings()) ?? SmithSettings()
-        lastSync = UserDefaults.standard.object(forKey: "lastSync") as? Date
         aboutYou.fade()
+    }
+
+    /// Files from before the vault key were sealed under the device key: once read,
+    /// they are saved again under the vault key, so the device key no longer opens them.
+    private func resealLegacyFiles() {
+        let legacy = EncryptedFile.takeLegacyReads()
+        guard loaded, !legacy.isEmpty else { return }
+        if legacy.contains("chronicles.smith"), let snapshot { save(snapshot, "chronicles.smith") }
+        if legacy.contains("journal-vault.smith") { save(journal, "journal-vault.smith") }
+        if legacy.contains("about-you.smith") { save(aboutYou, "about-you.smith") }
+        if legacy.contains("conversations.smith") { save(Records(items: conversations, tombstones: conversationTombstones), "conversations.smith") }
+        if legacy.contains("letters.smith") { save(Records(items: letters, tombstones: letterTombstones), "letters.smith") }
+    }
+
+    /// Smith locked: the key goes, and so does everything personal held in memory.
+    func closeVault() {
+        // The key first, so clearing the values below can't write empty files over the real ones
+        EncryptedFile.setVaultKey(nil)
+        applyingFromChronicles = true
+        defer { applyingFromChronicles = false }
+        snapshot = nil; journal = []
+        aboutYou = AboutYouStore()
+        conversations = []; conversationTombstones = []
+        letters = []; letterTombstones = []
+        smithRecordsUnreadable = false
     }
 
     struct Records<T: Codable>: Codable { var items: [T]; var tombstones: [Tombstone] }
@@ -272,6 +318,10 @@ final class SmithStore {
             EncryptedFile.delete(f)
         }
         smithRecordsUnreadable = false
+        // A fresh key, made at the next save. Also the way out when the old one won't open.
+        Keychain.resetStorageKey()
+        EncryptedFile.setVaultKey(nil)
+        loaded = true
         onErased?()
     }
 }

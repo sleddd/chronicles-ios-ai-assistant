@@ -6,6 +6,14 @@ public protocol LocalTool: Sendable {
     var description: String { get }
     var inputSchema: JSONValue { get }
     func run(_ input: JSONValue) async throws -> String
+    /// True for a tool that changes something (a write to Chronicles, Smith's memory).
+    /// After a web search in the same turn these wait for the person's own go-ahead:
+    /// a page Smith read must never be what decides that something gets written.
+    var changesData: Bool { get }
+}
+
+extension LocalTool {
+    public var changesData: Bool { false }
 }
 
 extension LocalTool {
@@ -68,6 +76,9 @@ public struct ChatRunner: Sendable {
             onEvent(.sentence(clean))
         }
 
+        // Set once anything from the web has been read in this turn
+        var readTheWeb = false
+
         for _ in 0..<maxRounds {
             var acc = StreamAccumulator()
             for try await e in transport.stream(request) {
@@ -82,23 +93,33 @@ public struct ChatRunner: Sendable {
             request.messages.append(["role": "assistant", "content": .array(acc.contentForEcho)])
 
             // Web searches: what was searched for (the results go to Claude from the search itself)
+            if acc.content.contains(where: { ($0["type"]?.string ?? "").hasPrefix("server_tool_use") || ($0["type"]?.string ?? "").hasSuffix("_tool_result") }) {
+                readTheWeb = true
+            }
             for block in acc.content where block["type"]?.string == "server_tool_use" {
                 if let q = block["input"]?["query"]?.string { onEvent(.lookedUp(tool: block["name"]?.string ?? "web_search", result: q)) }
             }
             switch acc.stopReason {
             case "tool_use":
                 var results: [JSONValue] = []
-                for block in acc.content where block["type"]?.string == "tool_use" {
+                for block in acc.contentForEcho where block["type"]?.string == "tool_use" {
                     let id = block["id"]?.string ?? ""
                     let name = block["name"]?.string ?? ""
                     if acc.invalidToolIDs.contains(id) {
                         results.append(toolResult(id, "The tool input was incomplete or not valid JSON. Try again.", error: true))
+                    } else if let tool = tools.first(where: { $0.name == name }), tool.changesData, readTheWeb {
+                        _ = tool
+                        results.append(toolResult(id, "Not done. You searched the web in this reply, and after reading from the web nothing is changed without the person's own go-ahead. Tell them what you would do and ask; do it only once they answer.", error: false))
                     } else if let tool = tools.first(where: { $0.name == name }) {
                         do {
                             let out = try await tool.run(block["input"] ?? [:])
                             onEvent(.lookedUp(tool: name, result: out))
                             results.append(toolResult(id, out, error: false))
-                        } catch { results.append(toolResult(id, "Tool failed: \(error.localizedDescription)", error: true)) }
+                        } catch {
+                            // A Chronicles failure is described in Smith's words, never the server's
+                            let why = (error as? ChroniclesError)?.forModel ?? error.localizedDescription
+                            results.append(toolResult(id, "Tool failed: \(why)", error: true))
+                        }
                     } else {
                         results.append(toolResult(id, "No tool named \(name).", error: true))
                     }
@@ -109,7 +130,13 @@ public struct ChatRunner: Sendable {
                 continue // a long server-side search paused; resend so it carries on
             case "refusal":
                 if shown.isEmpty { emit("I can't help with that one.") }
+                // The partial turn isn't kept (it may hold half a tool call): what was said instead is
+                if let last = request.messages.indices.last {
+                    request.messages[last] = ["role": "assistant", "content": .string(shown.joined(separator: " "))]
+                }
                 return ChatTurnResult(text: shown.joined(separator: " "), messages: request.messages)
+            case "model_context_window_exceeded":
+                throw ClaudeError.api("This conversation has grown too long for me to hold. Tap Done (I'll keep a summary) and start a new one.")
             default: // end_turn, max_tokens, stop_sequence
                 // Cut off (the length limit) while asking for a tool: that request was never
                 // answered, and the API refuses any later message while it sits in the history

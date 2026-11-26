@@ -71,9 +71,10 @@ nonisolated enum SecureEnclaveVault {
     }
 
     /// Opens inside the chip. With the presence lock, the system asks for Face ID / Touch ID / passcode.
-    static func open(_ sealed: Data, lock: Lock, reason: String? = nil) throws -> Data {
+    static func open(_ sealed: Data, lock: Lock, reason: String? = nil, context given: LAContext? = nil) throws -> Data {
         guard sealed.count > 65 + 28 else { throw CocoaError(.coderReadCorrupt) }
-        let context = LAContext()
+        // A context that has already been through Touch ID / Face ID isn't asked again
+        let context = given ?? LAContext()
         if let reason { context.localizedReason = reason }
         let me = try key(lock, context: lock == .presence ? context : nil)
         let ephemeralPub = try P256.KeyAgreement.PublicKey(x963Representation: sealed.prefix(65))
@@ -92,9 +93,9 @@ nonisolated enum SecureEnclaveVault {
         try write(try seal(data, lock: lock), to: url)
     }
 
-    static func load(name: String, lock: Lock, reason: String? = nil) throws -> Data? {
+    static func load(name: String, lock: Lock, reason: String? = nil, context: LAContext? = nil) throws -> Data? {
         guard let sealed = try? Data(contentsOf: fileURL(name)) else { return nil }
-        return try open(sealed, lock: lock, reason: reason)
+        return try open(sealed, lock: lock, reason: reason, context: context)
     }
 
     static func exists(_ name: String) -> Bool { FileManager.default.fileExists(atPath: fileURL(name).path) }

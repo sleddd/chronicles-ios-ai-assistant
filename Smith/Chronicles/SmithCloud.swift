@@ -31,11 +31,16 @@ final class SmithCloud {
     private let store: SmithStore
     private let writer: () -> ChroniclesWriter?
     private let account: () -> String?
+    private let takenTopicIDs: () async -> Set<Int>
+    /// Raised by an erase or a sign-out, so a sync that was mid-way doesn't put anything back.
+    private var epoch = 0
 
-    init(store: SmithStore, writer: @escaping () -> ChroniclesWriter?, account: @escaping () -> String?) {
-        self.store = store; self.writer = writer; self.account = account
+    init(store: SmithStore, writer: @escaping () -> ChroniclesWriter?, account: @escaping () -> String?,
+         takenTopicIDs: @escaping () async -> Set<Int> = { [] }) {
+        self.store = store; self.writer = writer; self.account = account; self.takenTopicIDs = takenTopicIDs
         state = EncryptedFile.read(State.self, Self.file) ?? State()
-        stateLoaded = EncryptedFile.isAvailable
+        // Read at the first sync after each unlock (its file opens only while unlocked)
+        stateLoaded = false
         store.onSmithDataChanged = { [weak self] in self?.changedHere() }
         store.onErased = { [weak self] in self?.erased() }
     }
@@ -62,11 +67,14 @@ final class SmithCloud {
     /// and delete every memory and letter from Chronicles at the next sign-in.
     private func erased() {
         pending?.cancel(); pending = nil
+        epoch += 1
         state = State(); lastRemote = []; topicIDs = [:]
     }
 
     func signedOut() {
         lastRemote = []; topicIDs = [:]
+        state = State(); stateLoaded = false
+        epoch += 1
         pending?.cancel(); pending = nil
     }
 
@@ -82,8 +90,13 @@ final class SmithCloud {
             state = EncryptedFile.read(State.self, Self.file) ?? State()
             stateLoaded = true
         }
-        // Another account on this device: start its agreement afresh
-        if state.account != account { state = State(account: account) }
+        let epoch = self.epoch
+        // Another account on this device: start its agreement afresh. The memories and
+        // letters here belong to the account before, and are not sent to this one.
+        if state.account != account {
+            if state.account != nil { store.applySmithRecords([]) }
+            state = State(account: account)
+        }
         // This device's records couldn't be opened: "missing here" must not be read as
         // "deleted here". With no agreement, Chronicles' copy is simply taken.
         if store.smithRecordsUnreadable { state.base = [:] }
@@ -95,6 +108,8 @@ final class SmithCloud {
         var base = Dictionary(remote.map { ($0.record.id, $0.record.fingerprint) }, uniquingKeysWith: { a, _ in a })
         var problem: String?
         var keep = plan.keep
+        // Changes that didn't reach Chronicles: its copy is still the old one
+        var unsent = Set<UUID>()
         let remoteByEntry = Dictionary(remote.map { ($0.entryID, $0) }, uniquingKeysWith: { a, _ in a })
         // Chronicles wouldn't take a change to one of the person's own entries: its copy
         // comes back here (so the two agree and it isn't tried for ever), and they're told
@@ -107,7 +122,7 @@ final class SmithCloud {
         func topicID(for record: SmithRecord) async -> Int? {
             if let id = topicIDs[record.topic] { return id }
             do {
-                let id = try await writer.createTopic(named: record.topic)
+                let id = try await writer.createTopic(named: record.topic, taken: await takenTopicIDs().union(topicIDs.values))
                 topicIDs[record.topic] = id
                 return id
             } catch { problem = error.localizedDescription; return nil }
@@ -128,7 +143,7 @@ final class SmithCloud {
                 base[rec.id] = rec.fingerprint
             } catch ChroniclesError.refused where theirs {
                 if let r = remoteByEntry[entryID] { putBack(r) }
-            } catch { problem = error.localizedDescription }   // base unchanged: tried again next time
+            } catch { problem = error.localizedDescription; unsent.insert(rec.id) }   // base unchanged: tried again next time
         }
         let deleted = Set(plan.delete)
         for entryID in plan.delete {
@@ -158,16 +173,24 @@ final class SmithCloud {
             catch { problem = error.localizedDescription }   // still read where it is; tried again next time
         }
 
+        // Erased or signed out while this was under way: nothing from it is applied
+        guard epoch == self.epoch else { return }
         store.applySmithRecords(keep)
         state.base = base.filter { entryOf[$0.key] != nil }
         state.remote = entryOf
         EncryptedFile.write(state, Self.file)
 
         // Chronicles as it now is, for the next change made here
+        // (Where a change or a delete didn't go through, Chronicles still has what it had:
+        // recording this device's version as "agreed" would revert the change next time)
+        let remoteByID = Dictionary(remote.map { ($0.record.id, $0) }, uniquingKeysWith: { a, _ in a })
         lastRemote = keep.compactMap { rec in
-            entryOf[rec.id].map { RemoteSmithRecord(entryID: $0, record: rec, owned: remote.first { $0.record.id == rec.id }?.owned ?? true) }
-        }
+            if unsent.contains(rec.id), let old = remoteByID[rec.id] { return old }
+            return entryOf[rec.id].map { RemoteSmithRecord(entryID: $0, record: rec, owned: remoteByID[rec.id]?.owned ?? true) }
+        } + remote.filter { r in deleted.contains(r.entryID) && entryOf[r.record.id] != nil && !keep.contains { $0.id == r.record.id } }
         lastProblem = problem
+        // Everything agreed with Chronicles: files that couldn't be opened are whole again
+        if problem == nil { store.smithRecordsRecovered() }
 
         if again {
             again = false

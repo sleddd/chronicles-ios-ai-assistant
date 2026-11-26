@@ -71,7 +71,8 @@ final class SmithBrain {
         concernsShown = concerns
         // Signed in to Chronicles: "behind on exports" doesn't apply; a failed sync does
         let freshness = chronicles.state == .notSetUp ? currentNudge()?.line(today: today)
-            : chronicles.lastError.map { "I couldn't reach Chronicles just now (\($0))." }
+            // (Never the error's own text: it can carry the server's words, and this goes into Smith's instructions)
+            : chronicles.lastError.map { _ in "I couldn't reach Chronicles just now, so what I have may be a little behind." }
         var ctx = SmithContext(name: s.name, snapshot: store.snapshot, journalDigest: store.journalDigestText,
                             aboutYou: s.memoryEnabled ? store.aboutYou.contextText() : nil,
                             recentConversations: s.memoryEnabled ? Array(store.conversations.suffix(6)) : [],
@@ -106,7 +107,7 @@ final class SmithBrain {
                                installExpires: InstallInfo.expiration, isPad: isPad)
     }
 
-    private func tools() -> [LocalTool] {
+    private func tools(actions: Bool = true) -> [LocalTool] {
         let snap = store.snapshot
         let ctx = context()
         let digest = store.journalDigestText
@@ -117,7 +118,7 @@ final class SmithBrain {
             JournalSummaryTool { digest }, CurrentTimeTool(),
             WeatherTool { try await weather.fetchLine() },
             MemoryTool { [weak self] action in await MainActor.run { self?.memory(action) ?? "Not saved." } },
-        ] + (chronicles.isUnlocked ? ChroniclesActionTools.all(chronicles.actionContext(estimate: nutrientEstimator())) : [])
+        ] + (actions && chronicles.isUnlocked ? ChroniclesActionTools.all(chronicles.actionContext(estimate: nutrientEstimator())) : [])
     }
 
     /// Nutrients for a meal, the way Chronicles' own estimator asks (same prompt and limits).
@@ -167,6 +168,9 @@ final class SmithBrain {
         // One reply at a time: a second message sent while Smith is still answering waits
         // its turn. Two at once would each finish by replacing the other's history.
         while let running = current { await running.value; if current == running { current = nil } }
+        // Locked while waiting: nothing is sent
+        guard chronicles.isUnlocked else { return }
+        lastReplyIsBriefing = false
         let line = ChatLine(who: .you, text: t)
         turns.append(Turn(lineID: line.id, messageCount: messages.count, text: t))
         lines.append(line)
@@ -222,16 +226,22 @@ final class SmithBrain {
 
     /// Stop whatever Smith is doing. While he's still answering, your message is
     /// taken back (returned, for the typing box) so you can say it again.
+    ///
+    /// Stopped while he's reading out a finished answer: the answer stays in the chat,
+    /// and what you said is still handed back, so it's in the box to edit and send again.
     func stop() -> String? {
         conversationMode = false
+        let wasSpeaking = voice.state == .speaking
         voice.cancelListening()
         voice.stopSpeaking()
-        guard isThinking else { return nil }
-        return removeLastTurn()
+        if isThinking { return removeLastTurn() }
+        return wasSpeaking ? turns.last?.text : nil
     }
 
     /// Smith's latest reply, said again a different way.
-    var canRegenerate: Bool { !isThinking && turns.last != nil && lines.last?.who == .smith }
+    var canRegenerate: Bool { !isThinking && turns.last != nil && lines.last?.who == .smith && !lastReplyIsBriefing }
+    /// The latest reply is a briefing, not an answer to the latest thing they said.
+    private var lastReplyIsBriefing = false
 
     func regenerate() async {
         guard canRegenerate, let turn = turns.last else { return }
@@ -241,9 +251,7 @@ final class SmithBrain {
         messages = Array(messages.prefix(turn.messageCount + 1))
         if let i = lines.firstIndex(where: { $0.id == turn.lineID }) { lines.removeSubrange((i + 1)...) }
         // A different answer this time (an instruction for this turn only)
-        // (With the system prompt, not in the history: the history only ever holds what was said)
-        let again = SystemBlock("Answer their last message again, freshly: a different angle and different wording from any earlier attempt.")
-        let task = Task { await respond(spoken: !store.settings.muted, extraRules: [again]) }
+        let task = Task { await respond(spoken: !store.settings.muted, turnInstruction: "Answer their last message again, freshly: a different angle and different wording from any earlier attempt.") }
         current = task
         await task.value
         if current == task { current = nil }
@@ -259,21 +267,50 @@ final class SmithBrain {
         if let id = summaryID { store.deleteConversation(id) }
         summaryID = nil
         messages = []; lines = []; turns = []; noted = []
+        frozenSystem = nil; lastDaySent = nil
         safety.endConversation()
         isThinking = false; workingOn = nil
         refreshHeadline()
     }
 
-    private func respond(spoken: Bool, extraRules: [SystemBlock] = []) async {
+    /// Smith locked: whatever was under way stops. A reply still arriving could
+    /// otherwise go on speaking, and its tools go on writing, after the lock.
+    func lockedOut() {
+        current?.cancel(); current = nil
+        idleTimer?.invalidate()
+        conversationMode = false
+        voice.cancelListening(); voice.stopSpeaking()
+        isThinking = false; workingOn = nil
+    }
+
+    /// The system prompt of this conversation, fixed at its first reply (see `SmithContext.stableBlocks`).
+    @ObservationIgnored private var frozenSystem: [SystemBlock]?
+    @ObservationIgnored private var lastDaySent: String?
+
+    private func respond(spoken: Bool, turnInstruction: String? = nil) async {
         let speak = spoken || (store.settings.speakTypedReplies && !store.settings.muted)
         isThinking = true
         lastError = nil
         defer { isThinking = false; workingOn = nil; scheduleCheckpoint() }
         let ctx = context()
         let runner = self.runner
+        // The system prompt is fixed for the conversation. What changes turn by turn (the
+        // clock, the day's facts, safety rules, a one-off instruction) follows what they
+        // said as a system message in the history, and stays there.
+        if frozenSystem == nil { frozenSystem = ctx.stableBlocks(spoken: speak && !store.settings.muted) + [styleRules] }
+        if messages.last?["role"]?.string == "user" {
+            let day = ctx.dayText()
+            // The day's facts only when they changed; otherwise just the time (the first line)
+            let facts = day.split(separator: "\n", maxSplits: 1).dropFirst().first.map(String.init) ?? ""
+            var note = facts == lastDaySent ? String(day.split(separator: "\n", maxSplits: 1).first ?? "") : day
+            lastDaySent = facts
+            for rule in safety.extraRules { note += "\n\n" + rule.text }
+            if let turnInstruction { note += "\n\n" + turnInstruction }
+            messages.append(["role": "system", "content": .string(note)])
+        }
         // Medium: enough thought to catch sarcasm, irony and a running joke; still quick
         let request = ClaudeRequest(model: store.settings.model, maxTokens: 16000, effort: "medium",
-                                    system: ctx.systemBlocks(spoken: speak && !store.settings.muted) + [styleRules] + safety.extraRules + extraRules,
+                                    system: frozenSystem ?? [],
                                     messages: messages, tools: runner.toolDefinitions(webSearch: true))
         let voice = self.voice
         let muted = store.settings.muted
@@ -284,7 +321,7 @@ final class SmithBrain {
         // What goes to Claude for this reply, to show under it
         var sent = SentInfo()
         if !lastUser.isEmpty { sent.parts.append(.init(title: "Your message", text: lastUser)) }
-        let earlier = max(0, messages.count - 1)
+        let earlier = max(0, messages.filter { $0["role"]?.string != "system" }.count - 1)
         if earlier > 0 { sent.parts.append(.init(title: "Earlier in this chat", text: "\(earlier) earlier message\(earlier == 1 ? "" : "s") in this conversation: what you said and Smith's replies.")) }
         if let about = ctx.aboutYou { sent.parts.append(.init(title: "What Smith knows about you", text: about)) }
         if !ctx.recentConversations.isEmpty {
@@ -354,7 +391,8 @@ final class SmithBrain {
             sink.finish()
             await consumer.value
             if Task.isCancelled || error is CancellationError { return }
-            // Keep the history valid: drop the unanswered question.
+            // Keep the history valid: drop the unanswered question (and the note that followed it).
+            if messages.last?["role"]?.string == "system" { messages.removeLast() }
             if case .some(let last) = messages.last, last["role"]?.string == "user" { messages.removeLast() }
             lastError = error.localizedDescription
             lines.append(ChatLine(who: .note, text: error.localizedDescription))
@@ -441,7 +479,7 @@ final class SmithBrain {
 
     /// The morning briefing, spoken.
     func briefing(spoken: Bool = true) async {
-        guard chronicles.isUnlocked, !isThinking else { return }
+        guard chronicles.isUnlocked else { return }
         freshnessNudge = currentNudge()
         await weather.refresh(fahrenheit: store.settings.fahrenheit)
         pill = "MORNING BRIEFING"
@@ -451,9 +489,17 @@ final class SmithBrain {
             \(store.settings.goalMentionInBriefing ? ", plus a plain mention of a goal in progress (information, not a pep talk)" : ""). \
             Keep it brief and natural, the way a friend would catch them up. If there's a stale-data note, end with it.
             """
+        // In line with everything else: one reply at a time
+        while let running = current { await running.value; if current == running { current = nil } }
+        guard chronicles.isUnlocked else { return }
         messages.append(["role": "user", "content": .string(ask)])
         lines.append(ChatLine(who: .note, text: "Morning briefing"))
-        await respond(spoken: spoken)
+        lastReplyIsBriefing = true
+        let task = Task { await respond(spoken: spoken) }
+        current = task
+        await task.value
+        if current == task { current = nil }
+        guard chronicles.isUnlocked else { return }
         store.updateLocalSettings { $0.lastGreetingDay = today }
     }
 
@@ -471,7 +517,10 @@ final class SmithBrain {
             return "I'm worried about you. Please call or text 988 to talk with someone right now, or call 911 if you're in danger. Open Smith and we can keep talking."
         }
         let ctx = context()
-        let runner = self.runner
+        // Asked through Siri, perhaps not by them: it can look things up, not write or remember
+        let runner = ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }),
+                                tools: tools(actions: false).filter { !$0.changesData },
+                                phraseGuard: PhraseGuard(phrases: store.settings.bannedPhrases))
         let req = ClaudeRequest(model: store.settings.model, effort: "low", system: ctx.systemBlocks(spoken: true),
                                 messages: [["role": "user", "content": .string(question)]],
                                 tools: runner.toolDefinitions(webSearch: true))
@@ -509,6 +558,7 @@ final class SmithBrain {
         conversationMode = false
         let transcript = messages
         messages = []
+        frozenSystem = nil; lastDaySent = nil
         lines = []
         turns = []
         noted = []
@@ -522,7 +572,10 @@ final class SmithBrain {
 
     private func wrapUp(_ transcript: [JSONValue], replacing earlier: UUID? = nil, ofLiveChat: Bool = true) async {
         let earlier = ofLiveChat ? (earlier ?? summaryID) : nil
-        guard store.settings.memoryEnabled else { return }
+        // Locked: the conversation stays where it is, in memory; nothing about it is sent anywhere
+        guard store.settings.memoryEnabled, chronicles.isUnlocked else { return }
+        // (The per-turn notes are Smith's own, not part of what was said)
+        let transcript = transcript.filter { $0["role"]?.string != "system" }
         var result = await OnDeviceWrapUp.run(transcript: WrapUp.transcript(transcript, name: store.settings.name))
         if result == nil {
             let r = ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }), tools: [])

@@ -5,6 +5,8 @@ import SmithCore
 /// "Good morning, Smith" — the morning briefing, spoken by Siri.
 struct GoodMorningIntent: AppIntent {
     static let title: LocalizedStringResource = "Morning briefing"
+    // Never from a locked device: what Smith says back is personal
+    static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     static let description = IntentDescription("Smith greets you and tells you about your day.")
 
     @MainActor
@@ -27,6 +29,8 @@ struct GoodMorningIntent: AppIntent {
 /// "Ask Smith …"
 struct AskSmithIntent: AppIntent {
     static let title: LocalizedStringResource = "Ask Smith"
+    // Never from a locked device: what Smith says back is personal
+    static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     static let description = IntentDescription("Ask Smith anything.")
 
     @Parameter(title: "Question", requestValueDialog: "What would you like to ask?")
@@ -42,6 +46,8 @@ struct AskSmithIntent: AppIntent {
 /// "What's on my day?"
 struct WhatsOnMyDayIntent: AppIntent {
     static let title: LocalizedStringResource = "What's on my day"
+    // Never from a locked device: what Smith says back is personal
+    static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     static let description = IntentDescription("Smith tells you what's planned today.")
 
     @MainActor
@@ -54,6 +60,8 @@ struct WhatsOnMyDayIntent: AppIntent {
 /// Opens Smith listening, in conversation mode. Link this to the "Hey Smith" Vocal Shortcut.
 struct TalkToSmithIntent: AppIntent {
     static let title: LocalizedStringResource = "Talk to Smith"
+    // Never from a locked device: what Smith says back is personal
+    static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     static let description = IntentDescription("Opens Smith, already listening.")
     static let openAppWhenRun = true
 
@@ -74,6 +82,8 @@ struct TalkToSmithIntent: AppIntent {
 /// "A letter" (signed with whatever name you chose for your letters)
 struct LetterFromHenryIntent: AppIntent {
     static let title: LocalizedStringResource = "A letter"
+    // Never from a locked device: what Smith says back is personal
+    static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     static let description = IntentDescription("Writes you a letter.")
 
     @MainActor

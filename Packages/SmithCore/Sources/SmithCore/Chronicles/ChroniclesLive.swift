@@ -80,6 +80,20 @@ public enum ChroniclesError: LocalizedError, Equatable {
     /// The journal is under a new key now: the key in memory no longer opens it.
     case keyChanged
 
+    /// For the model: says what kind of failure it was, never the server's own text
+    /// (that text would be the server writing into Smith's instructions).
+    public var forModel: String {
+        switch self {
+        case .locked: "Smith is locked; they need to unlock first."
+        case .refused: "Chronicles didn't allow that."
+        case .notFound: "That wasn't found in Chronicles."
+        case .missingTopic(let t): "There's no \(t) topic in their Chronicles yet."
+        case .limit: "Chronicles has had as many changes as it takes for now."
+        case .rekeying, .keyChanged: "Chronicles is busy changing its key; try again later."
+        case .badURL, .signInFailed, .server: "Chronicles couldn't be reached."
+        }
+    }
+
     public var errorDescription: String? {
         switch self {
         case .badURL: "The Chronicles address in Settings isn’t valid."
@@ -105,6 +119,14 @@ public struct ChroniclesSession: Sendable {
     let keys: [SymmetricKey]
     public init(email: String, token: String, keys: [SymmetricKey]) { self.email = email; self.token = token; self.keys = keys }
     var key: SymmetricKey { keys[0] }
+    /// The key Smith's saved files are sealed under while this account is unlocked:
+    /// made from the master key, so the files open only when Smith itself is unlocked
+    /// (not merely the device), and never for another account.
+    public var vaultKey: SymmetricKey {
+        HKDF<SHA256>.deriveKey(inputKeyMaterial: keys[0], salt: Data("smith:vault:v1".utf8),
+                               info: Data(ChroniclesCrypto.normalizeEmail(email).utf8), outputByteCount: 32)
+    }
+
     /// The raw key, only to seal it to the Secure Enclave for a quick unlock.
     public var keyData: Data { keys[0].withUnsafeBytes { Data($0) } }
 
@@ -221,7 +243,10 @@ extension ChroniclesClient {
         let cursor = try await call("GET", "/api/entries/cursor", nil, s).body["cursor"]?.string
         var out: [LiveEntry] = []
         var offset = 0
+        var pages = 0
         while true {
+            pages += 1
+            guard pages <= Self.maxPages else { throw ChroniclesError.server(0, "Chronicles kept sending more pages than Smith will read.") }
             let r = try await call("GET", "/api/entries?v=2&limit=2000&offset=\(offset)", nil, s)
             let rows = r.body["entries"]?.array ?? []
             out += try openAll(rows, s)
@@ -251,7 +276,12 @@ extension ChroniclesClient {
         Set((try await call("GET", "/api/entries/visible-ids", nil, s).body["ids"]?.array ?? []).compactMap(\.int))
     }
 
-    public func topics(_ s: ChroniclesSession) async throws -> [(id: Int, name: String)] {
+    /// `sealed`: the name was opened with the account's key, which binds it to this id.
+    /// A readable name is the server's word alone, so once the account has any sealed
+    /// topic, readable ones are left out: otherwise the server could call the Journal
+    /// topic "Smith memories" (or "Task") and have its entries read as something
+    /// that is sent to the model.
+    public func topics(_ s: ChroniclesSession) async throws -> [(id: Int, name: String, sealed: Bool)] {
         let rows = try await call("GET", "/api/topics", nil, s).body.array ?? []
         // Sealed topics that no longer open: the key changed
         let sealed = rows.filter { $0["payload"]?.string != nil }
@@ -264,9 +294,10 @@ extension ChroniclesClient {
             guard let id = row["id"]?.int else { return nil }
             if let p = row["payload"]?.string, let iv = row["iv"]?.string,
                let rec = try? ChroniclesCrypto.openRecord(kind: ChroniclesCrypto.RecordKind.topic, id: ChroniclesCrypto.topicRecordID(id), payload: p, iv: iv, keys: s.keys) {
-                return (id, rec["name"]?.string ?? "")
+                return (id, rec["name"]?.string ?? "", true)
             }
-            return row["name"]?.string.map { (id, $0) }
+            guard sealed.isEmpty else { return nil }
+            return row["name"]?.string.map { (id, $0, false) }
         }
     }
 
@@ -278,17 +309,20 @@ extension ChroniclesClient {
             guard let key = row["key"]?.string, let value = row["value"] else { continue }
             if value["ciphertext"] != nil, value["iv"] != nil {
                 if let opened = try? ChroniclesCrypto.openSetting(key: key, sealed: value, keys: s.keys) { out[key] = opened }
-            } else if key != Self.sealedPrivacyKey, key != "aiConfig" {
-                // (The AI key setting too: a readable one would be the server choosing
-                // which Anthropic key Smith's requests go out under.)
-                // The sealed "Don't share with AI" choices are never taken readable:
-                // a readable value there would be the server's own, passed off as
-                // the copy only the account's key can write
+            } else if key == Self.readablePrivacyKey {
+                // The one setting meant to be readable: the server's own copy of the
+                // "Don't share with AI" choices, which can only add to what is hidden.
+                // Everything else Smith reads (the name, habits, goal categories, the home
+                // city, the AI key) Chronicles stores sealed only, so a readable value
+                // for any of them is the server's own words and is not believed.
                 out[key] = value
             }
         }
         return out
     }
+
+    /// A list that is still "not finished" after this many pages isn't a real list.
+    static let maxPages = 500
 
     /// The "Don't share with AI" choices, sealed with the account's key (what Smith believes).
     static let sealedPrivacyKey = "aiPrivacySealed"
@@ -314,7 +348,10 @@ extension ChroniclesClient {
     public func bills(_ s: ChroniclesSession) async throws -> [JSONValue] {
         var out: [JSONValue] = []
         var offset = 0
+        var pages = 0
         while true {
+            pages += 1
+            guard pages <= Self.maxPages else { throw ChroniclesError.server(0, "Chronicles kept sending more pages than Smith will read.") }
             let r: HTTPResponse
             do { r = try await call("GET", "/api/finance/bills?v=2&offset=\(offset)", nil, s) } catch ChroniclesError.refused { return [] }
             let rows = r.body["records"]?.array ?? []
@@ -358,8 +395,27 @@ public actor ChroniclesLiveSync {
     var entries: [Int: LiveEntry] = [:]
     var cursor: String?
     var topicNames: [Int: String] = [:]
+    /// Topics whose names were opened with the account's key (see `ChroniclesClient.topics`).
+    var sealedTopicIDs: Set<Int> = []
+    /// Every topic id seen on a topic row or on an entry. A "new" topic id the server
+    /// hands out must not be one of these (see `ChroniclesWriter.createTopic`).
+    var seenTopicIDs: Set<Int> = []
+    /// The account's sealed "Don't share with AI" choices as last opened (kept by the
+    /// app between launches). If the server stops sending them, or sends an older or
+    /// unreadable copy, these still hold.
+    var rememberedPrivacy: JSONValue?
+    /// The highest revision seen of the AI key setting. Chronicles numbers each save
+    /// of it (`_rev`, inside the sealed value), so an older number is an old copy replayed.
+    var aiConfigRev: Double
 
-    public init(client: ChroniclesClient, session: ChroniclesSession) { self.client = client; self.session = session }
+    public init(client: ChroniclesClient, session: ChroniclesSession, rememberedPrivacy: JSONValue? = nil, aiConfigRev: Double = 0) {
+        self.client = client; self.session = session; self.rememberedPrivacy = rememberedPrivacy; self.aiConfigRev = aiConfigRev
+    }
+
+    static func rev(_ v: JSONValue?) -> Double { v?["_rev"]?.double ?? 0 }
+
+    /// Topic ids already in use, as far as this device has seen.
+    public func knownTopicIDs() -> Set<Int> { seenTopicIDs.union(topicNames.keys) }
 
     public struct Result: Sendable {
         public var snapshot: ChroniclesSnapshot
@@ -380,6 +436,9 @@ public actor ChroniclesLiveSync {
         public var smithRecords: [RemoteSmithRecord] = []
         /// Smith's topics that exist, by name.
         public var smithTopicIDs: [String: Int] = [:]
+        /// The sealed "Don't share with AI" choices now believed, for the app to keep.
+        public var sealedPrivacy: JSONValue?
+        public var aiConfigRev: Double = 0
     }
 
     var journalIDs: Set<Int> = []
@@ -415,8 +474,34 @@ public actor ChroniclesLiveSync {
     public func refresh(now: Date = Date()) async throws -> Result {
         let topics = try await client.topics(session)
         topicNames = Dictionary(topics.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        sealedTopicIDs = Set(topics.filter(\.sealed).map(\.id))
+        seenTopicIDs.formUnion(topicNames.keys)
         // First, so every entry taken below is checked against the account's choices
         var settings = try await client.settings(session)
+        // The sealed choices fail closed. Missing, unreadable, or older than the copy last
+        // opened here: what was hidden then stays hidden (the two are joined, so a
+        // genuine newer copy that hides more still counts).
+        let sealedNow = settings[ChroniclesClient.sealedPrivacyKey]
+        if let before = rememberedPrivacy {
+            // (A copy with no revision at all is from before they were numbered: older than any numbered one)
+            let older = Self.rev(sealedNow) < Self.rev(before)
+            if sealedNow == nil || older {
+                var joined = before.object ?? [:]
+                for k in ["hiddenTopicIds", "hiddenFeatures"] {
+                    joined[k] = .array((before[k]?.array ?? []) + (sealedNow?[k]?.array ?? []))
+                }
+                settings[ChroniclesClient.sealedPrivacyKey] = .object(joined)
+            } else {
+                rememberedPrivacy = sealedNow
+            }
+        } else if let sealedNow {
+            rememberedPrivacy = sealedNow
+        }
+        // The AI key setting the same way: an older copy (a key since replaced, or AI
+        // since switched off) is not used
+        if let cfg = settings["aiConfig"] {
+            if Self.rev(cfg) < aiConfigRev { settings["aiConfig"] = nil } else { aiConfigRev = Self.rev(cfg) }
+        }
         let kept = Self.keptFromAI(settings)
         let hiddenTopics = kept.topics
         // A feature kept from AI: its records are never asked for or held, whatever the server would send
@@ -432,6 +517,7 @@ public actor ChroniclesLiveSync {
             return ExportParser.kind(of: t.flatMap { topicNames[$0] }) == nil
         }
         func take(_ e: LiveEntry) {
+            if let t = e.metadata["_taxonomyId"]?.int { seenTopicIDs.insert(t) }
             // Kept from AI: never held, whatever the server sent
             if Self.keptFromAI(e, hiddenTopics: hiddenTopics) {
                 entries[e.id] = nil
@@ -511,9 +597,12 @@ public actor ChroniclesLiveSync {
                             isFullLoad: full, hiddenTopicIDs: hiddenTopics, anthropicKey: Self.anthropicKey(settings["aiConfig"]),
                             homePlace: HomePlace(settings["dashboardConfig"]?["places"]?.array?.first))
         // Smith's own topics and what's in them (newest first)
-        for (id, name) in topicNames { if let t = SmithTopics.which(name) { result.smithTopicIDs[t] = id } }
+        // Only a sealed name makes a topic one of Smith's
+        for (id, name) in topicNames where sealedTopicIDs.contains(id) { if let t = SmithTopics.which(name) { result.smithTopicIDs[t] = id } }
+        result.sealedPrivacy = rememberedPrivacy
+        result.aiConfigRev = aiConfigRev
         let smithTopic = Dictionary(result.smithTopicIDs.map { ($0.value, $0.key) }, uniquingKeysWith: { a, _ in a })
-        let legacyLetters = Set(topicNames.filter { SmithTopics.isLegacyLetters($0.value) }.keys)
+        let legacyLetters = Set(topicNames.filter { sealedTopicIDs.contains($0.key) && SmithTopics.isLegacyLetters($0.value) }.keys)
         result.smithRecords = entries.values.compactMap { e -> (Date, RemoteSmithRecord)? in
             guard let t = e.metadata["_taxonomyId"]?.int else { return nil }
             // In the old "Letters" topic only what Smith itself made is Smith's; the rest is the person's own

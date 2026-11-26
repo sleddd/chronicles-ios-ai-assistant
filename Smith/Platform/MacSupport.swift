@@ -88,15 +88,20 @@ enum LoginItem {
 @MainActor
 final class WakeWatcher {
     static let shared = WakeWatcher()
-    var onFirstWakeOfDay: (() -> Void)?
+    /// Returns whether the greeting was started (false while Smith is locked, or it's switched off).
+    var onFirstWakeOfDay: (() -> Bool)?
     private var observers: [Any] = []
 
     private var lastGreetingDay: (() -> String?)?
 
     func start(lastGreetingDay: @escaping () -> String?) {
         self.lastGreetingDay = lastGreetingDay
-        // Only after the Mac is unlocked. The screen waking comes before anyone has
-        // signed in, and the briefing (doses, bills) must never be read out at the login screen.
+        // Only once the Mac is unlocked: the briefing (doses, bills) must never be read out
+        // at the login screen. The screen waking counts on a Mac that asks for no password
+        // (`check` looks at whether the screen is locked); otherwise the unlock notice does.
+        observers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { WakeWatcher.shared.check() }
+        })
         observers.append(DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { WakeWatcher.shared.check() }
@@ -109,9 +114,17 @@ final class WakeWatcher {
 
     private func check() {
         let today = Self.todayKey()
-        guard handledDay != today, lastGreetingDay?() != today, Calendar.current.component(.hour, from: Date()) >= 4 else { return }
-        handledDay = today
-        onFirstWakeOfDay?()
+        guard handledDay != today, lastGreetingDay?() != today, Calendar.current.component(.hour, from: Date()) >= 4,
+              !Self.screenIsLocked else { return }
+        // Marked only when the greeting really started: locked this time, it gets another chance
+        if onFirstWakeOfDay?() == true { handledDay = today }
+    }
+
+    /// Smith was just unlocked: the day's greeting, if it hasn't been given yet.
+    func smithUnlocked() { check() }
+
+    static var screenIsLocked: Bool {
+        (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool ?? false
     }
 
     static func todayKey() -> String {

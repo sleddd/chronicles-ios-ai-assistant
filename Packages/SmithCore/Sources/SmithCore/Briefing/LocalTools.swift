@@ -136,6 +136,7 @@ public struct WeatherTool: LocalTool {
 /// Smith's memory, in the conversation: what he notices on his own, what
 /// they ask him to remember, and what they ask him to forget.
 public struct MemoryTool: LocalTool {
+    public var changesData: Bool { true }
     public enum Action: Sendable { case remember(String, Fact.Category), note(String, Fact.Category), forget(String) }
     let handle: @Sendable (Action) async -> String
     public init(handle: @escaping @Sendable (Action) async -> String) { self.handle = handle }

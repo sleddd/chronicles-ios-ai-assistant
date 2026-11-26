@@ -10,7 +10,8 @@ public enum Day {
 
     public static func parse(_ s: String) -> (y: Int, m: Int, d: Int)? {
         let p = s.prefix(10).split(separator: "-").compactMap { Int($0) }
-        guard p.count == 3 else { return nil }
+        // A real month and day: "2026-11-00" from outside must not become index -1 somewhere
+        guard p.count == 3, (1...9999).contains(p[0]), (1...12).contains(p[1]), (1...31).contains(p[2]) else { return nil }
         return (p[0], p[1], p[2])
     }
 

@@ -439,7 +439,7 @@ struct ChatView: View {
                 }
                 // Hear it again (loading while the voice is made, Stop while it plays)
                 let mine = replayingID == line.id
-                HStack(spacing: 18) {
+                let controls = HStack(spacing: 18) {
                     HearButton(busy: mine && app.voice.state == .speaking, loading: mine && app.voice.preparing, compact: true) {
                         replayingID = line.id
                         app.voice.preview(app.smithSpeaker, text: line.text)
@@ -456,8 +456,12 @@ struct ChatView: View {
                         .help("Answer again, differently")
                     }
                 }
-                .padding(.leading, 14 + ChatBubble.tail)
-                if let sent = line.sent { SentDisclosure(info: sent).padding(.leading, 14 + ChatBubble.tail) }
+                // One row: hear it, regenerate, then "What was sent" to their right (its details open below)
+                if let sent = line.sent {
+                    SentDisclosure(info: sent) { controls }.padding(.leading, 14 + ChatBubble.tail)
+                } else {
+                    controls.padding(.leading, 14 + ChatBubble.tail)
+                }
             }
         case .note:
             Caps(line.text, size: 9, color: Theme.faint)
@@ -562,25 +566,31 @@ extension Notification.Name {
 
 /// Under each of Smith's replies: what was sent to Claude to write it. Collapsed;
 /// each part opens on its own.
-struct SentDisclosure: View {
+struct SentDisclosure<Leading: View>: View {
     let info: SentInfo
+    /// What sits to the left of the "What was sent" switch, on the same row.
+    @ViewBuilder var leading: Leading
     @State private var open = false
     @State private var openParts: Set<UUID> = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 18) {
+            leading
+            // The controls stay on the left; "Sent to Claude" sits at the far right of the row
+            Spacer(minLength: 12)
             Button { withAnimation(.easeInOut(duration: 0.2)) { open.toggle() } } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold))
                         .rotationEffect(.degrees(open ? 90 : 0))
-                    Text("What was sent to Claude").font(Theme.rounded(11, .medium))
-                    if !open { Text("· \(info.parts.count - 1) parts").font(Theme.rounded(11)).foregroundStyle(Theme.faint) }
+                    Text("Sent to Claude").font(Theme.rounded(11, .medium))
                 }
                 .foregroundStyle(Theme.faint)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .help("See exactly what went to Claude for this reply")
+            }
             if open {
                 VStack(alignment: .leading, spacing: 6) {
                     ForEach(info.parts) { part in

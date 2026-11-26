@@ -122,11 +122,24 @@ public struct URLSessionTransport: ClaudeTransport {
                     req.setValue("server-side-fallback-2026-07-01", forHTTPHeaderField: "anthropic-beta")
                     req.httpBody = try request.body.encoded()
 
-                    let (bytes, response) = try await session.bytes(for: req)
-                    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                    if status != 200 {
+                    var bytes: URLSession.AsyncBytes
+                    var attempt = 0
+                    while true {
+                        let (b, response) = try await session.bytes(for: req)
+                        let http = response as? HTTPURLResponse
+                        let status = http?.statusCode ?? 0
+                        if status == 200 { bytes = b; break }
                         var text = ""
-                        for try await line in bytes.lines { text += line }
+                        for try await line in b.lines { text += line }
+                        // Busy or rate-limited: wait as asked (or a little longer each time) and try
+                        // again, twice at most. A 429 with no "retry-after" is a spending limit: not retried.
+                        let after = http?.value(forHTTPHeaderField: "retry-after").flatMap(Double.init)
+                        let retryable = (status == 429 && after != nil) || status == 529 || (500...504).contains(status)
+                        if retryable, attempt < 2, (after ?? 0) <= 20 {
+                            attempt += 1
+                            try await Task.sleep(for: .seconds(max(after ?? 0, Double(attempt) * 1.5)))
+                            continue
+                        }
                         let message = (try? JSONValue.parse(Data(text.utf8)))?["error"]?["message"]?.string ?? text
                         throw ClaudeError.http(status: status, message: message)
                     }

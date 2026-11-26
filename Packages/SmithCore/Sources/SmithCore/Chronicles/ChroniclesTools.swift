@@ -16,6 +16,8 @@ public struct ChroniclesActionContext: Sendable {
     public var hasDoseLink: @Sendable (String) async -> Bool = { _ in false }
     /// The entry id of a day's wellness check-in, if there is one.
     public var wellnessEntryID: @Sendable (String) async -> Int? = { _ in nil }
+    /// A check-in was just made for this day: the next update must find it, not make another.
+    public var noteWellnessEntry: @Sendable (String, Int) async -> Void = { _, _ in }
     public var now: @Sendable () -> Date
     public var timeZone: TimeZone
 
@@ -62,6 +64,7 @@ func bestMatch<T>(_ items: [T], name: (T) -> String, query: String) -> (match: T
 public struct LogMealTool: LocalTool {
     let ctx: ChroniclesActionContext
     public init(_ ctx: ChroniclesActionContext) { self.ctx = ctx }
+    public var changesData: Bool { true }
     public var name: String { "log_meal" }
     public var description: String { "Log something they ate or drank in Chronicles (Meals). Nutrients are estimated the way Chronicles does." }
     public var inputSchema: JSONValue {
@@ -99,6 +102,7 @@ public struct LogMealTool: LocalTool {
 public struct LogDoseTool: LocalTool {
     let ctx: ChroniclesActionContext
     public init(_ ctx: ChroniclesActionContext) { self.ctx = ctx }
+    public var changesData: Bool { true }
     public var name: String { "log_dose" }
     public var description: String { "Mark a medication dose taken or skipped in Chronicles. Scheduled medications tick the next untaken dose today; as-needed ones log a new dose." }
     public var inputSchema: JSONValue {
@@ -161,6 +165,7 @@ extension LogDoseTool {
 public struct CheckHabitTool: LocalTool {
     let ctx: ChroniclesActionContext
     public init(_ ctx: ChroniclesActionContext) { self.ctx = ctx }
+    public var changesData: Bool { true }
     public var name: String { "check_habit" }
     public var description: String { "Check off a habit in Chronicles for today (or a given day)." }
     public var inputSchema: JSONValue {
@@ -190,6 +195,7 @@ public struct CheckHabitTool: LocalTool {
 public struct SaveNoteTool: LocalTool {
     let ctx: ChroniclesActionContext
     public init(_ ctx: ChroniclesActionContext) { self.ctx = ctx }
+    public var changesData: Bool { true }
     public var name: String { "save_note" }
     public var description: String { "Save something they said as a Chronicles entry: in Journal, or in a topic they name (e.g. Idea)." }
     public var inputSchema: JSONValue {
@@ -221,6 +227,7 @@ public struct SaveNoteTool: LocalTool {
 public struct AddTaskTool: LocalTool {
     let ctx: ChroniclesActionContext
     public init(_ ctx: ChroniclesActionContext) { self.ctx = ctx }
+    public var changesData: Bool { true }
     public var name: String { "add_task" }
     public var description: String { "Add a task to Chronicles." }
     public var inputSchema: JSONValue {
@@ -258,6 +265,7 @@ public struct AddTaskTool: LocalTool {
 public struct SetTaskStatusTool: LocalTool {
     let ctx: ChroniclesActionContext
     public init(_ ctx: ChroniclesActionContext) { self.ctx = ctx }
+    public var changesData: Bool { true }
     public var name: String { "set_task_status" }
     public var description: String { "Mark a Chronicles task done, in progress, or back to to-do." }
     public var inputSchema: JSONValue {
@@ -293,6 +301,7 @@ public struct SetTaskStatusTool: LocalTool {
 public struct UpdateWellnessTool: LocalTool {
     let ctx: ChroniclesActionContext
     public init(_ ctx: ChroniclesActionContext) { self.ctx = ctx }
+    public var changesData: Bool { true }
     public var name: String { "update_wellness" }
     public var description: String {
         "Update their wellness check-in in Chronicles (the wellness card): mood, sleep, how rested they felt, water, stress, and the \"Your day\" answers. Set only what they told you; everything else stays as it is."
@@ -339,6 +348,7 @@ public struct UpdateWellnessTool: LocalTool {
         guard let writer = await ctx.writer() else { return "Smith is locked; unlock first." }
         let day = input["day"]?.string.flatMap { Day.isValid($0) ? String($0.prefix(10)) : nil } ?? ctx.today
         let undo = try await writer.saveWellness(entryID: await ctx.wellnessEntryID(day), day: day, set: set, addWater: add, topicID: topic)
+        if case .deleteEntry(let id) = undo { await ctx.noteWellnessEntry(day, id) }
         let r = WriteResult(summary: "Updated \(day == ctx.today ? "today's" : Day.short(day) + "'s") wellness card: \(what).", undo: undo)
         await ctx.didWrite(r)
         return r.summary
@@ -348,6 +358,7 @@ public struct UpdateWellnessTool: LocalTool {
 public struct MarkBillPaidTool: LocalTool {
     let ctx: ChroniclesActionContext
     public init(_ ctx: ChroniclesActionContext) { self.ctx = ctx }
+    public var changesData: Bool { true }
     public var name: String { "mark_bill_paid" }
     public var description: String { "Mark a bill paid in Chronicles for its next unpaid due date. You never see or say amounts." }
     public var inputSchema: JSONValue {

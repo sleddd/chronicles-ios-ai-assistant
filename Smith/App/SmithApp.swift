@@ -61,10 +61,13 @@ struct SmithApp: App {
         WakeWatcher.shared.onFirstWakeOfDay = {
             let app = AppModel.shared
             // Locked: no panel and no Touch ID prompt on every wake; the briefing waits for an unlock
-            guard app.chronicles.isUnlocked else { return }
-            guard app.store.settings.greetOnWake, app.store.settings.lastGreetingDay != Day.key() else { return }
-            PanelController.shared.show { PanelView().environment(app) }
+            guard app.chronicles.isUnlocked else { return false }
+            guard app.store.settings.greetOnWake, app.store.settings.lastGreetingDay != Day.key() else { return false }
+            // The small panel is for when Smith is tucked away in the menu bar. Already in
+            // front (they just unlocked it in its window): the briefing shows there, once.
+            if !NSApp.isActive { PanelController.shared.show { PanelView().environment(app) } }
             app.morningBriefing()
+            return true
         }
         WakeWatcher.shared.start { AppModel.shared.store.settings.lastGreetingDay }
         WakeWordListener.shared.onWake = { after in
@@ -108,6 +111,10 @@ struct RootView: View {
             #endif
             .onChange(of: app.chronicles.state) { _, _ in
                 app.brain.refreshHeadline()
+                #if os(macOS)
+                // The day's greeting waited for this if Smith was locked when the Mac woke
+                if app.chronicles.isUnlocked { WakeWatcher.shared.smithUnlocked() }
+                #endif
                 Task { await app.safety.refresh() }
             }
             .onChange(of: app.chronicles.lastSync) { _, _ in app.brain.refreshHeadline() }

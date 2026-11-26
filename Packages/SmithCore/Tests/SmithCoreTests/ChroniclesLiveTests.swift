@@ -159,7 +159,9 @@ func seededServer() throws -> FakeChronicles {
     try s.put(entry: 50, content: "<p>Exercise</p>", metadata: ["_taxonomyId": 5, "_customFields": [
         "habitName": "Exercise", "targetCount": 1, "targetPeriod": "day", "days": [], "isActive": true]])
     s.settings["habitLog"] = try ChroniclesCrypto.sealSetting(key: "habitLog", value: ["50": ["2026-11": "01"]], mk: s.mk)
-    s.settings["displayName"] = "Henry"
+    // Sealed, as Chronicles stores it; a readable name would be the server's word alone
+    s.settings["displayName"] = try ChroniclesCrypto.sealSetting(key: "displayName", value: "Henry", mk: s.mk)
+    s.settings["timezone"] = "Mars/Olympus"   // readable: not believed
     s.settings["dashboardConfig"] = try ChroniclesCrypto.sealSetting(key: "dashboardConfig", value: [
         "hidden": [], "places": [["name": "Portland", "latitude": 45.52, "longitude": -122.68, "timezone": "America/Los_Angeles"]]], mk: s.mk)
     s.settings["aiConfig"] = try ChroniclesCrypto.sealSetting(key: "aiConfig", value: [
@@ -203,6 +205,7 @@ func seededServer() throws -> FakeChronicles {
         #expect(r.snapshot.habits.first?.count(on: "2026-11-02") == 1)
         #expect(r.snapshot.bills.first?.name == "Rent")
         #expect(r.snapshot.displayName == "Henry")
+        #expect(r.snapshot.timeZone == nil)
         // The account's own Anthropic key, for memory only; nothing else from that setting
         #expect(r.anthropicKey == "sk-ant-TEST-KEY")
         // Chronicles' home city, for the weather
