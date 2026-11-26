@@ -734,7 +734,8 @@ enum HenryWriter {
         let focus = ["one small, specific moment from their recent days", "something you admire in them that you haven't said before",
                      "a hope or a plan for the two of you", "a memory you imagine sharing with them", "something playful or teasing",
                      "what they bring to an ordinary evening", "a question you'd love to hear them answer", "a quiet, tender thought"].randomElement()!
-        var ask = HenryPrompt.userMessage(theirMessage: message, dayContext: day, aboutThem: about)
+        var ask = HenryPrompt.userMessage(theirMessage: message, dayContext: day, aboutThem: about,
+                                          theirName: store.snapshot?.displayName)
         ask += "\n\nThis letter's focus: \(focus)."
         if !recent.isEmpty {
             ask += "\n\nLetters you've already written them (newest first). Write something new: a different greeting and opening line, "

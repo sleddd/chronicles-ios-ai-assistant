@@ -15,6 +15,14 @@ import Testing
         #expect(ExportParser.idString(.number(12)) == "12")
     }
 
+    @Test func aLetterIsToldTheirNameAndNotToInventOne() {
+        let named = HenryPrompt.userMessage(theirMessage: nil, dayContext: nil, aboutThem: nil, theirName: "Claudette")
+        #expect(named.contains("Their name is Claudette") && named.contains("never by any other name"))
+        let unnamed = HenryPrompt.userMessage(theirMessage: nil, dayContext: nil, aboutThem: nil)
+        #expect(unnamed.contains("never make up a name"))
+        #expect(HenryPrompt.system(HenryPersona()).contains("Never invent names"))
+    }
+
     @Test func aDateIsARealMonthAndDay() {
         #expect(Day.parse("2026-11-00") == nil)
         #expect(Day.parse("2026-13-01") == nil)

@@ -51,7 +51,8 @@ public enum HenryPrompt {
             Always loving, encouraging and positive. Never cruel, controlling, jealous, possessive or guilt-tripping, \
             and never discourage them from the people in their life. Never patronize: no "I'm proud of you", "good job", \
             "you've got this" or praise that grades them; speak as an equal who adores them. No therapy-speak, no \
-            labelling their feelings for them, no slang, no "haha". Write only the letter: a greeting, the body, and a \
+            labelling their feelings for them, no slang, no "haha". Never invent names, people, places or shared history \
+            that you haven't been told about. Write only the letter: a greeting, the body, and a \
             sign-off with your name. No title, no markdown. If they ask whether you are human, say plainly that you are an AI \
             writing as \(p.name).
             """,
@@ -62,8 +63,15 @@ public enum HenryPrompt {
         return parts.filter { !$0.isEmpty }.joined(separator: "\n\n")
     }
 
-    public static func userMessage(theirMessage: String?, dayContext: String?, aboutThem: String?) -> String {
+    /// `theirName`: the name Chronicles has for them. Without it the model was left to
+    /// greet "the person you love" with nothing to call them by, and invented a name.
+    public static func userMessage(theirMessage: String?, dayContext: String?, aboutThem: String?, theirName: String? = nil) -> String {
         var parts: [String] = []
+        if let n = theirName?.trimmingCharacters(in: .whitespacesAndNewlines), !n.isEmpty {
+            parts.append("Their name is \(n). Call them by that name or a term of endearment, and never by any other name.")
+        } else {
+            parts.append("You don't know their name. Use terms of endearment (my dear, my love), and never make up a name for them.")
+        }
         if let aboutThem { parts.append("Things you know about them:\n\(aboutThem)") }
         if let dayContext { parts.append("What's going on in their life lately (general):\n\(dayContext)") }
         if let m = theirMessage?.trimmingCharacters(in: .whitespacesAndNewlines), !m.isEmpty {
