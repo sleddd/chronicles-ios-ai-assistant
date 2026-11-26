@@ -141,9 +141,10 @@ struct FakeSummarizer: JournalSummarizer {
     }
 
     @Test func personaHasNoBannedPhrasesInItsExamples() {
-        // The prompt lists banned phrases on purpose; everything else in it must be clean.
+        // The prompt lists banned phrases on purpose (the "Never:" list, and the flattery and
+        // platitude examples); everything else in it must be clean.
         let prompt = PersonaPrompt.system(spoken: true)
-        let withoutLists = prompt.components(separatedBy: "\n").filter { !$0.hasPrefix("- ") && !$0.hasPrefix("Never:") }.joined(separator: "\n")
+        let withoutLists = prompt.components(separatedBy: "\n").filter { !$0.hasPrefix("- ") && !$0.hasPrefix("Never:") && !$0.hasPrefix("Flattery: ") }.joined(separator: "\n")
         #expect(g.findBanned(in: withoutLists).filter { $0 != "fair" }.isEmpty, "\(g.findBanned(in: withoutLists))")
     }
 }

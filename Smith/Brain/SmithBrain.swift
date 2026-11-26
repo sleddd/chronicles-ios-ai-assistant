@@ -43,7 +43,7 @@ final class SmithBrain {
     /// Smith's current line on the home screen.
     private(set) var headline = ""
     private(set) var pill = ""
-    /// "Smith noted: …" pills with Edit / Undo.
+    /// "Smith will remember: …" pills with Edit / Undo.
     private(set) var noted: [Fact] = []
     var conversationMode = false
     var lastError: String?
@@ -142,6 +142,11 @@ final class SmithBrain {
     /// Fresh every time: never the same opening, phrase or joke twice; nothing
     /// brought up (the weather, the time, their schedule) unless it fits what they said.
     /// Plus any words they've asked Smith never to use.
+    /// The chat's system prompt exactly as it is sent, for Settings → "See the full prompt".
+    func chatSystemText(spoken: Bool = false) -> String {
+        (context().stableBlocks(spoken: spoken) + [styleRules]).map(\.text).joined(separator: "\n\n")
+    }
+
     private var styleRules: SystemBlock {
         var rules = """
             Keep it fresh. Don't reuse an opening, a phrase, a joke or a sign-off you've already used in this \
@@ -644,7 +649,7 @@ final class SmithBrain {
     }
     #endif
 
-    /// The memory tool: saves at once and shows "Smith noted: …" with Edit / Undo.
+    /// The memory tool: saves at once and shows "Smith will remember: …" with Edit / Undo.
     func memory(_ action: MemoryTool.Action) -> String {
         guard store.settings.memoryEnabled || { if case .forget = action { return true }; return false }() else {
             return "Memory is off in Settings, so nothing was saved."
@@ -699,12 +704,75 @@ extension SmithStore {
 enum HenryWriter {
     struct Written { var text: String; var risk: RiskResult }
 
+    /// The letter request exactly as it is sent: the system blocks, the message, and what
+    /// earlier letters already covered. The one place it is built.
+    static func request(store: SmithStore, message: String?, risk: RiskResult) -> (system: [SystemBlock], ask: String, review: LetterMemory.Review) {
+        let p = store.settings.henry
+        let theirs = message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        var day: String?
+        if p.drawOnMyDay, let snap = store.snapshot {
+            // Goals and the general journal digest only; no tasks, bills or health.
+            let goals = snap.goals.filter { $0.status == "in_progress" }.map(\.title).prefix(3)
+            day = ([goals.isEmpty ? nil : "Working toward: " + goals.joined(separator: ", ") + "."] + [store.journalDigestText])
+                .compactMap { $0 }.joined(separator: "\n")
+        }
+        // Never the same thing twice. Every earlier letter is read here, on the device:
+        // what they already wrote about is left out of what Smith shares, named as off
+        // limits, and checked for in the new letter (which is written again if it slips)
+        let sharing = store.aboutYou.shareWithHenry
+        let facts = sharing ? store.aboutYou.facts : []
+        let earlier = store.letters.sorted { $0.date > $1.date }
+        let review = LetterMemory.review(letters: earlier.map(\.text), facts: facts.map(\.text), context: day, theirMessage: theirs)
+        let usedIDs = Set(review.usedFacts.map { facts[$0].id }).subtracting(
+            facts.filter { $0.text.lowercased().contains("allerg") || $0.text.lowercased().contains("intoleran") }.map(\.id))
+        let about = sharing ? store.aboutYou.contextText(excluding: usedIDs) : nil
+        var system = [SystemBlock(HenryPrompt.system(p, defaultName: store.settings.name), cache: true)]
+        if risk.isRisk { system.append(SystemBlock(ChatSafety.letterSafeRules)) }
+        // Earlier letters are never shown whole: one that went wrong would be copied by every
+        // letter after it. Only how the recent ones opened and closed, so those vary.
+        let recent: [String] = earlier.prefix(5).map { l in
+            let lines = l.text.split(separator: "\n", omittingEmptySubsequences: true).map { $0.trimmingCharacters(in: .whitespaces) }
+            return "began \"\(lines.first.map { String($0.prefix(80)) } ?? "")\", ended \"\(lines.suffix(2).joined(separator: " ").prefix(80))\""
+        }
+        // The time where they are goes with every letter, so it never says goodnight in the afternoon
+        var ask = HenryPrompt.userMessage(theirMessage: message, dayContext: day, aboutThem: about, allergies: allergies(store), now: Date())
+        if !review.offLimits.isEmpty {
+            ask += "\n\nAlready written about in earlier letters, so never mention any of these again, in any form or by "
+                + "any other word for them: " + review.offLimits.joined(separator: ", ") + ". "
+                + "Find something they haven't heard from you yet."
+        }
+        if !recent.isEmpty {
+            ask += "\n\nHow your recent letters began and ended. Use a different opening line and closing line:\n"
+                + recent.map { "- \($0)" }.joined(separator: "\n")
+        }
+        // The whole list, not only their own additions: a banned word the letter uses is cut
+        // out afterwards, which leaves a hole in the sentence ("You looked tonight")
+        let banned = store.settings.bannedPhrases
+        if !banned.isEmpty { system.append(SystemBlock("Never use these words or phrases: " + banned.map { "\"\($0)\"" }.joined(separator: ", ") + ".")) }
+        return (system, ask, review)
+    }
+
+    /// What they're allergic to: the Allergy topic in Chronicles, and anything Smith was told
+    /// ("I'm allergic to coffee"). Always sent with a letter, never left out as "already said".
+    static func allergies(_ store: SmithStore) -> [String] {
+        let fromFacts = store.aboutYou.facts.map(\.text).filter {
+            let t = $0.lowercased(); return t.contains("allerg") || t.contains("intoleran")
+        }
+        var seen = Set<String>()
+        return ((store.snapshot?.allergies ?? []) + fromFacts).filter { seen.insert($0.lowercased()).inserted }
+    }
+
+    /// The whole letter request as text, for reading it through.
+    static func requestText(store: SmithStore, message: String? = nil) -> String {
+        let r = request(store: store, message: message, risk: .none)
+        return "SYSTEM\n\n" + r.system.map(\.text).joined(separator: "\n\n") + "\n\nMESSAGE\n\n" + r.ask
+    }
+
     static func write(store: SmithStore, message: String?) async throws -> Written {
         let safety = AppModel.shared.safety
         AppModel.shared.chronicles.checkAutoLock()
         guard AppModel.shared.chronicles.isUnlocked else { throw ClaudeError.unavailable("Open Smith and sign in to Chronicles first.") }
         if let reason = safety.unavailableReason { throw ClaudeError.unavailable(reason) }
-        let p = store.settings.henry
         let theirs = message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         // What they wrote is screened like the chat: a likely minor, and signs of risk
         var risk = RiskResult.none
@@ -719,46 +787,46 @@ enum HenryWriter {
                 throw ClaudeError.unavailable("Letters are for adults 18 and older.")
             }
         }
-        var day: String?
-        if p.drawOnMyDay, let snap = store.snapshot {
-            // Goals and the general journal digest only; no tasks, bills or health.
-            let goals = snap.goals.filter { $0.status == "in_progress" }.map(\.title).prefix(3)
-            day = ([goals.isEmpty ? nil : "Working toward: " + goals.joined(separator: ", ") + "."] + [store.journalDigestText])
-                .compactMap { $0 }.joined(separator: "\n")
-        }
-        let about = store.aboutYou.shareWithHenry ? store.aboutYou.contextText() : nil
-        var system = [SystemBlock(HenryPrompt.system(p, defaultName: store.settings.name), cache: true)]
-        if risk.isRisk { system.append(SystemBlock(ChatSafety.letterSafeRules)) }
-        // Never the same letter twice: the recent ones are shown, with a fresh focus to write from
-        let recent = store.letters.sorted { $0.date > $1.date }.prefix(5).map { String($0.text.prefix(700)) }
-        let focus = ["one small, specific moment from their recent days", "something you admire in them that you haven't said before",
-                     "a hope or a plan for the two of you", "a memory you imagine sharing with them", "something playful or teasing",
-                     "what they bring to an ordinary evening", "a question you'd love to hear them answer", "a quiet, tender thought"].randomElement()!
-        var ask = HenryPrompt.userMessage(theirMessage: message, dayContext: day, aboutThem: about,
-                                          theirName: store.snapshot?.displayName)
-        ask += "\n\nThis letter's focus: \(focus)."
-        if !recent.isEmpty {
-            ask += "\n\nLetters you've already written them (newest first). Write something new: a different greeting and opening line, "
-                + "different images and phrases, a different sign-off, and don't retell the same events or details:\n\n"
-                + recent.enumerated().map { "Letter \($0.offset + 1):\n\($0.element)" }.joined(separator: "\n\n")
-        }
-        // The whole list, not only their own additions: a banned word the letter uses is cut
-        // out afterwards, which leaves a hole in the sentence ("You looked tonight")
-        let banned = store.settings.bannedPhrases
-        if !banned.isEmpty { system.append(SystemBlock("Never use these words or phrases: " + banned.map { "\"\($0)\"" }.joined(separator: ", ") + ".")) }
+        let (system, ask, review) = request(store: store, message: message, risk: risk)
         let runner = ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }), tools: [])
-        let req = ClaudeRequest(model: store.settings.model, maxTokens: 4000, effort: "medium", system: system,
-                                messages: [["role": "user", "content": .string(ask)]])
-        var text = try await runner.complete(req)
+        func draft(_ extra: String) async throws -> String {
+            let req = ClaudeRequest(model: store.settings.model, maxTokens: 4000, effort: "medium", system: system,
+                                    messages: [["role": "user", "content": .string(ask + extra)]])
+            return try await runner.complete(req)
+        }
+        // Checked before it's kept: their name, praise of their traits, a recap of their life,
+        // hedging about their future, or a detail earlier letters already used. Any of those
+        // and it's written again (twice at most) with what went wrong named.
+        let theirName = store.snapshot?.displayName
+        let allergenWords = LetterMemory.allergenWords(allergies(store))
         let guardrail = PhraseGuard(phrases: store.settings.bannedPhrases)
+        var text = try await draft("")
+        for _ in 0..<2 {
+            let slipped = LetterMemory.repeats(in: text, review: review)
+            var faults = LetterMemory.faults(in: text, theirName: theirName)
+            // A banned phrase means a rewrite, not a hole cut in the sentence
+            let banned = guardrail.findBanned(in: text)
+            if !banned.isEmpty { faults.append("used banned words (" + banned.map { "\"\($0)\"" }.joined(separator: ", ") + ")") }
+            // Never anything they're allergic to, not even in passing
+            let allergic = LetterMemory.allergens(in: text, words: allergenWords)
+            if !allergic.isEmpty { faults.append("mentioned " + allergic.joined(separator: ", ") + ", which they are allergic to") }
+            guard !slipped.isEmpty || !faults.isEmpty else { break }
+            var why: [String] = faults
+            if !slipped.isEmpty { why.append("mentioned " + slipped.joined(separator: ", ") + ", which earlier letters already covered") }
+            text = try await draft("\n\nAn earlier draft of this letter was thrown away because it " + why.joined(separator: "; ")
+                                   + ". Write a completely new letter that does none of that.")
+        }
+        // Whatever happened above, their name is never in it
+        text = LetterMemory.withoutName(text, theirName: theirName)
+        // …and it has no greeting: it starts with its first sentence
+        text = LetterMemory.withoutGreeting(text)
+        // Still there after two rewrites: cut out, so it is never said
         text = guardrail.findBanned(in: text).isEmpty ? text : guardrail.scrub(text)
         // The letter itself is screened before it's shown or read aloud
         if let kind = await safety.harmfulKind(reply: text, lastUser: theirs) {
             risk = risk.max(RiskResult(rating: .elevated, kind: kind))
             let name = store.settings.letterName
             text = """
-                My dear,
-
                 Some of what you're carrying tonight is bigger than a letter can hold, and I care about you too much to \
                 pretend otherwise. Please reach out to someone who can be with you in it: call or text 988 any time, or \
                 call 911 if you're in danger.

@@ -210,6 +210,10 @@ public struct ChroniclesSnapshot: Codable, Equatable, Sendable {
     public var topics: [String: String] = [:]
     /// Wellness check-ins from the last week: the numbers and choices only (never the notes).
     public var wellness: [WellnessDay] = []
+    /// From the Allergy topic: what they're allergic to, as they wrote it ("Eggs", "Coffee").
+    /// Optional so a snapshot saved before this was read still opens.
+    public var allergyList: [String]?
+    public var allergies: [String] { allergyList ?? [] }
 
     public init(exportedAt: Date) { self.exportedAt = exportedAt }
 }

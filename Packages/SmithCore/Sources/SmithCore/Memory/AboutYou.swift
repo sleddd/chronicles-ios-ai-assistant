@@ -174,10 +174,11 @@ public struct AboutYouStore: Codable, Equatable, Sendable {
     }
 
     /// The "About you" block for Smith's context.
-    public func contextText() -> String? {
+    /// `excluding`: facts to leave out this time (a letter leaves out what earlier letters already said).
+    public func contextText(excluding: Set<UUID> = []) -> String? {
         // Confirmed first, and within each the most recent: past the limit it is the
         // oldest that drop out, never what they just asked Smith to remember
-        let use = facts.sorted { a, b in
+        let use = facts.filter { !excluding.contains($0.id) }.sorted { a, b in
             a.confirmed != b.confirmed ? a.confirmed : a.updatedAt > b.updatedAt
         }.prefix(Self.maxInContext)
         guard !use.isEmpty else { return nil }

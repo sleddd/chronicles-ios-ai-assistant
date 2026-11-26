@@ -472,7 +472,7 @@ struct ChatView: View {
 
     private func notedPill(_ f: Fact) -> some View {
         HStack(spacing: 10) {
-            Text("\(app.store.settings.name) noted: \(f.text)").font(Theme.rounded(13, .regular)).foregroundStyle(Theme.soft)
+            Text("\(app.store.settings.name) will remember: \(f.text)").font(Theme.rounded(13, .regular)).foregroundStyle(Theme.soft)
             Button("Edit") { editing = f }.buttonStyle(.plain).font(Theme.rounded(12, .medium)).foregroundStyle(Theme.violet)
             Button("Undo") { app.store.aboutYou.delete(f.id, marker: nil); app.brain.dismissNoted(f.id) }
                 .buttonStyle(.plain).font(Theme.rounded(12, .medium)).foregroundStyle(Theme.dim)

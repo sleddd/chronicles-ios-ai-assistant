@@ -31,6 +31,15 @@ public enum BannedPhrases {
         "I'm glad you're talking to me", "I'm glad you reached out",
         // Slang and filler
         "lol", "got you", "what's up", "drop it on me", "crushing it", "heads up",
+        // Words they've asked never to hear
+        "ledger",
+        // Terms of endearment: never, anywhere (the ones that can't mean anything else)
+        "my love", "my darling", "darling", "sweetheart", "sweetie", "babe", "my dear", "dearest", "beloved",
+        // Flattery and platitudes: never, anywhere
+        "you're amazing", "you are amazing", "you're incredible", "you are incredible", "you deserve the world",
+        "you deserve everything", "you are enough", "you're enough", "stronger than you know",
+        "everything happens for a reason", "this too shall pass", "brighter days", "one day at a time",
+        "light at the end of the tunnel", "silver lining", "it'll all work out", "it will all work out",
     ]
 
     public static let all: [String] = {

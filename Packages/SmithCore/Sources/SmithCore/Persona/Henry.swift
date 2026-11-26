@@ -33,6 +33,10 @@ public struct Letter: Codable, Equatable, Sendable, Identifiable {
 }
 
 public enum HenryPrompt {
+    /// The letter's instructions as they were on the night of Nov 25 (the user's call: every
+    /// rule about what a letter is "about" added since is gone), plus only what they asked
+    /// for by name: no greeting, no terms of endearment, never their name, never the same
+    /// thing twice.
     public static func system(_ persona: HenryPersona, defaultName: String = "Smith") -> String {
         var p = persona
         if p.name.trimmingCharacters(in: .whitespaces).isEmpty { p.name = defaultName }
@@ -51,10 +55,26 @@ public enum HenryPrompt {
             Always loving, encouraging and positive. Never cruel, controlling, jealous, possessive or guilt-tripping, \
             and never discourage them from the people in their life. Never patronize: no "I'm proud of you", "good job", \
             "you've got this" or praise that grades them; speak as an equal who adores them. No therapy-speak, no \
-            labelling their feelings for them, no slang, no "haha". Never invent names, people, places or shared history \
-            that you haven't been told about. Write only the letter: a greeting, the body, and a \
+            labelling their feelings for them, no slang, no "haha". Write only the letter: the body, and a \
             sign-off with your name. No title, no markdown. If they ask whether you are human, say plainly that you are an AI \
             writing as \(p.name).
+            """,
+            """
+            No greeting or salutation of any kind: no opening line addressed to them. Start straight in with the first \
+            sentence.
+            Never use a term of endearment, in any form, anywhere in the letter: no "my love", "love", "darling", \
+            "sweetheart", "sweetie", "honey", "babe", "baby", "dear", "dearest", "beloved", "my heart", "angel", and no \
+            other pet name.
+            Never write their name, or anyone's personal name. Write to them simply as "you".
+            Never say the same thing twice: each letter is new. Don't repeat what your earlier letters said, and don't \
+            reuse their openings, closings or images.
+            """,
+            """
+            Never use flattery. Never use platitudes.
+            Flattery: compliments on their looks, mind, heart, character, strength or effort ("you're amazing", \
+            "you're beautiful", "you deserve the world"). Platitudes: stock lines of comfort or wisdom ("everything \
+            happens for a reason", "this too shall pass", "brighter days ahead", "one day at a time", "it'll all work \
+            out", "you are enough", "something good is coming").
             """,
         ]
         if !p.samples.isEmpty {
@@ -63,14 +83,26 @@ public enum HenryPrompt {
         return parts.filter { !$0.isEmpty }.joined(separator: "\n\n")
     }
 
-    /// `theirName`: the name Chronicles has for them. Without it the model was left to
-    /// greet "the person you love" with nothing to call them by, and invented a name.
-    public static func userMessage(theirMessage: String?, dayContext: String?, aboutThem: String?, theirName: String? = nil) -> String {
-        var parts: [String] = []
-        if let n = theirName?.trimmingCharacters(in: .whitespacesAndNewlines), !n.isEmpty {
-            parts.append("Their name is \(n). Call them by that name or a term of endearment, and never by any other name.")
-        } else {
-            parts.append("You don't know their name. Use terms of endearment (my dear, my love), and never make up a name for them.")
+    /// What time it is where they are, so a letter never says goodnight in the afternoon.
+    public static func timeLine(now: Date = Date(), calendar: Calendar = .current) -> String {
+        let hour = calendar.component(.hour, from: now)
+        let part = hour < 5 ? "the middle of the night" : hour < 12 ? "morning" : hour < 17 ? "afternoon" : hour < 21 ? "evening" : "night"
+        let f = DateFormatter()
+        f.calendar = calendar; f.timeZone = calendar.timeZone; f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "EEEE, MMMM d, h:mm a"
+        return "Where they are it is \(f.string(from: now)): \(part). They will read this now. Anything you say about the time "
+            + "of day must fit it: no \"good night\", \"tonight\" or \"sleep well\" unless it is evening or night, and no "
+            + "\"good morning\" unless it is morning. You don't have to mention the time at all."
+    }
+
+    /// Their name is never sent. As on the night of Nov 25, plus the no-name / no-endearment
+    /// line and what they're allergic to.
+    public static func userMessage(theirMessage: String?, dayContext: String?, aboutThem: String?, allergies: [String] = [],
+                                   now: Date? = nil, calendar: Calendar = .current) -> String {
+        var parts: [String] = ["Never use their name or any term of endearment. Write to them simply as \"you\"."]
+        if let now { parts.append(timeLine(now: now, calendar: calendar)) }
+        if !allergies.isEmpty {
+            parts.append("They are allergic to: \(allergies.joined(separator: ", ")). Never offer, make, bring, plan or mention giving them anything with these in it.")
         }
         if let aboutThem { parts.append("Things you know about them:\n\(aboutThem)") }
         if let dayContext { parts.append("What's going on in their life lately (general):\n\(dayContext)") }

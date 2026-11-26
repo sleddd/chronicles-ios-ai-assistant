@@ -119,6 +119,9 @@ public enum ExportParser {
                     targetPeriod: cf["targetPeriod"]?.string ?? "day",
                     days: (cf["days"]?.array ?? []).compactMap(\.int), isActive: cf["isActive"]?.bool != false,
                     goalID: idString(cf["parentGoalId"]), log: log))
+            case "allergy":
+                let a = name(cf["allergen"], content).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !a.isEmpty { snap.allergyList = (snap.allergyList ?? []) + [a] }
             case "medication":
                 snap.medications.append(Medication(
                     id: id, name: name(cf["medicationName"], content), dosage: cf["dosage"]?.string ?? "",

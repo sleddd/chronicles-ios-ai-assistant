@@ -54,6 +54,8 @@ struct SmithSettings: Codable, Equatable {
     var henry = HenryPersona()
     /// Letters were first signed "Henry"; that default moved to the assistant's own name.
     var lettersRenamed = false
+    /// The leftover "Henry" was cleared a second time (some devices kept it).
+    var lettersNameReset = false
 
     /// Who signs the letters: the name chosen for them, or the assistant's own name.
     var letterName: String {

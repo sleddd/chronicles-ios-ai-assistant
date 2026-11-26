@@ -50,11 +50,29 @@ final class AppModel {
         chronicles = ChroniclesConnection(store: store)
         safety = SafetyCenter(chronicles: chronicles)
         brain = SmithBrain(store: store, voice: voice, weather: weather, chronicles: chronicles, safety: safety)
-        // The old built-in "Henry" becomes the assistant's own name (a name you chose stays)
-        if !store.settings.lettersRenamed {
+        migrateSettings()
+        applyVoiceSettings()
+        store.onLoaded = { [unowned self] in
+            self.migrateSettings()
+            self.chronicles.storeLoaded()
+            self.applyVoiceSettings()
+        }
+        chronicles.onLock = { [unowned self] in self.brain.lockedOut() }
+        weather.placeProvider = { [unowned self] in self.weatherPlace }
+    }
+
+    /// One-time corrections to saved settings. Run at launch, and again if the saved
+    /// settings could only be read later (a correction made to unloaded defaults is lost).
+    private func migrateSettings() {
+        guard store.loaded else { return }
+        // Letters are signed with the assistant's own name (Smith) unless they choose another.
+        // "Henry" was the old built-in name; an earlier clean-up missed some devices, so it
+        // is cleared again once. A name they type in Settings after this stays.
+        if !store.settings.lettersNameReset {
             store.updateSettings { s in
-                if s.henry.name == "Henry" { s.henry.name = "" }
+                if s.henry.name.trimmingCharacters(in: .whitespaces).caseInsensitiveCompare("Henry") == .orderedSame { s.henry.name = "" }
                 s.lettersRenamed = true
+                s.lettersNameReset = true
             }
         }
         // Privacy is controlled from Chronicles now; Smith's old duplicates are cleared once
@@ -64,13 +82,6 @@ final class AppModel {
                 s.privacyFromChronicles = true
             }
         }
-        applyVoiceSettings()
-        chronicles.onLock = { [unowned self] in self.brain.lockedOut() }
-        store.onLoaded = { [unowned self] in
-            self.chronicles.storeLoaded()
-            self.applyVoiceSettings()
-        }
-        weather.placeProvider = { [unowned self] in self.weatherPlace }
     }
 
     /// Where the weather is for. Chronicles' home city falls back to this

@@ -56,6 +56,7 @@ struct SettingsView: View {
                     Toggle("Mention a goal in the morning briefing", isOn: binding(\.goalMentionInBriefing))
                     Toggle("Temperatures in °F", isOn: Binding(get: { s.fahrenheit }, set: { v in store.updateSettings { $0.fahrenheit = v }; app.applyVoiceSettings() }))
                     Caps("Voices: download Enhanced or Premium voices in System Settings → Accessibility → Spoken Content.", size: 8, color: Theme.faint)
+                    PromptViewer(title: "See the full chat prompt") { app.brain.chatSystemText() }
                 }
 
                 SectionLabel("Words Smith never uses")
@@ -259,7 +260,7 @@ struct SettingsView: View {
                 sample: "Good morning. Here’s what’s on today.", model: s.elevenModel)
             elevenPicker("Letters voice", selection: Binding(get: { s.elevenHenryVoice }, set: { v in
                 store.updateSettings { $0.elevenHenryVoice = v }; app.applyVoiceSettings() }),
-                sample: "My love, I’ve been thinking about you all day.", model: .v4)
+                sample: "I’ve been thinking about you all day.", model: .v4)
             Picker("Model", selection: Binding(get: { s.elevenModel }, set: { v in store.updateSettings { $0.elevenModel = v }; app.applyVoiceSettings() })) {
                 ForEach(ElevenLabs.Model.allCases, id: \.self) { Text($0.label).tag($0) }
             }
@@ -405,7 +406,8 @@ struct SettingsView: View {
             Toggle("Draw on my day (goals and the general journal summary only)", isOn: binding(\.henry.drawOnMyDay))
             Toggle(h.name.isEmpty ? "Use what \(store.settings.name) knows about me" : "Let \(store.settings.letterName) use what \(store.settings.name) knows about me", isOn: Binding(get: { store.aboutYou.shareWithHenry }, set: { store.aboutYou.shareWithHenry = $0 }))
             voicePicker("Letters voice", selection: Binding(get: { store.settings.henryVoiceID }, set: { v in store.updateLocalSettings { $0.henryVoiceID = v } }),
-                        sample: "My love, I've been thinking about you all day.")
+                        sample: "I've been thinking about you all day.")
+            PromptViewer(title: "See the full letter prompt") { HenryWriter.requestText(store: store) }
         }
     }
 
@@ -520,6 +522,38 @@ struct FlowLayout: Layout {
             if x > bounds.minX && x + s.width > bounds.maxX { x = bounds.minX; y += rowH + spacing; rowH = 0 }
             v.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(s))
             x += s.width + spacing; rowH = max(rowH, s.height)
+        }
+    }
+}
+
+
+/// The exact text sent to Claude, built by the same code that sends it, so it can be
+/// read in full. Shown only here, on this device; nothing is copied or saved.
+struct PromptViewer: View {
+    let title: String
+    let text: () -> String
+    @State private var shown: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button { shown = shown == nil ? text() : nil } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold))
+                        .rotationEffect(.degrees(shown == nil ? 0 : 90))
+                    Text(title)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).foregroundStyle(Theme.violet)
+            if let shown {
+                ScrollView {
+                    Text(shown)
+                        .font(.system(size: 11, design: .monospaced)).foregroundStyle(Theme.dim).lineSpacing(3)
+                        .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(10)
+                }
+                .frame(maxHeight: 420)
+                .background(Color.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
         }
     }
 }
