@@ -66,37 +66,4 @@ enum Importer {
         return receipt
     }
 
-    /// The newest Chronicles export in the watched folder, if it's newer than what Smith has.
-    static func checkWatchedFolder(_ store: SmithStore) async -> Receipt? {
-        guard let bookmark = store.settings.watchedFolderBookmark else { return nil }
-        var stale = false
-        #if os(macOS)
-        let options: URL.BookmarkResolutionOptions = [.withSecurityScope]
-        #else
-        let options: URL.BookmarkResolutionOptions = []
-        #endif
-        guard let folder = try? URL(resolvingBookmarkData: bookmark, options: options, bookmarkDataIsStale: &stale) else { return nil }
-        let scoped = folder.startAccessingSecurityScopedResource()
-        defer { if scoped { folder.stopAccessingSecurityScopedResource() } }
-        let files = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey]))?
-            .filter { $0.pathExtension.lowercased() == "json" && $0.lastPathComponent.hasPrefix("chronicles-export") } ?? []
-        let newest = files.max {
-            ((try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast)
-                < ((try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast)
-        }
-        guard let newest, let data = try? Data(contentsOf: newest),
-              let peek = try? ExportParser.parse(data),
-              peek.snapshot.exportedAt > (store.snapshot?.exportedAt ?? .distantPast) else { return nil }
-        return try? await importData(data, into: store)
-    }
-
-    static func bookmark(for folder: URL) -> Data? {
-        let scoped = folder.startAccessingSecurityScopedResource()
-        defer { if scoped { folder.stopAccessingSecurityScopedResource() } }
-        #if os(macOS)
-        return try? folder.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
-        #else
-        return try? folder.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
-        #endif
-    }
 }

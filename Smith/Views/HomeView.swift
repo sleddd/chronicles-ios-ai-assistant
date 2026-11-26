@@ -6,6 +6,7 @@ import SmithCore
 struct HomeView: View {
     @Environment(AppModel.self) private var app
     @State private var importing = false
+    @State private var confirmRemoveChronicles = false
     var compact = false
 
     var body: some View {
@@ -14,25 +15,41 @@ struct HomeView: View {
             GlowBackground(mood: app.brain.pill == "DAILY REFLECTION")
             VStack(spacing: 0) {
                 topBar
-                if app.showChat {
+                if app.page != .home {
+                    pageContent
+                } else if app.showChat {
                     ChatView()
                 } else {
                     Spacer(minLength: 12)
-                    VStack(spacing: 18) {
-                        Caps(brain.pill, size: 10, color: Theme.text.opacity(0.75))
-                            .padding(.horizontal, 12).padding(.vertical, 6)
-                            .background(.ultraThinMaterial, in: Capsule())
+                    let listening = app.voice.state == .listening
+                    VStack(spacing: 22) {
+                        if listening {
+                            HStack(spacing: 10) {
+                                Circle().fill(Theme.teal).frame(width: 8, height: 8)
+                                Text("LISTENING").font(Theme.rounded(12, .semibold)).tracking(2.4).foregroundStyle(Theme.text)
+                            }
+                            .padding(.horizontal, 18).padding(.vertical, 9)
+                            .background(Color.black.opacity(0.45), in: Capsule())
+                            .transition(.opacity)
+                        }
                         Text(brain.headline)
-                            .font(Theme.rounded(compact ? 26 : 38))
+                            .font(Theme.rounded(compact ? 24 : 38))
+                            .frame(maxWidth: 900)
                             .multilineTextAlignment(.center)
-                            .foregroundStyle(Theme.text)
+                            .foregroundStyle(Theme.text.opacity(listening ? 0.4 : 1))
+                            .animation(.easeInOut(duration: 0.3), value: listening)
                             .padding(.horizontal, 28)
                             .contentTransition(.opacity)
                             .animation(.easeInOut(duration: 0.6), value: brain.headline)
+                        // Stats hidden: the greeting and the orb sit together in the middle
+                        if app.store.settings.statsHidden { orbBlock.padding(.top, 18) }
                     }
                     Spacer(minLength: 12)
                 }
-                orbArea
+                if app.page == .home {
+                    if app.showChat || !app.store.settings.statsHidden { orbBlock }
+                    inputArea
+                }
             }
             if let msg = app.importMessage { banner(msg) }
         }
@@ -49,10 +66,34 @@ struct HomeView: View {
             Button("Keep it", role: .cancel) { app.deleteSourceOffer = nil }
         } message: { Text("Smith has what it needs. The export is an unencrypted copy of your Chronicles data.") }
         .onReceive(NotificationCenter.default.publisher(for: .smithImport)) { _ in importing = true }
+        .alert("Remove Chronicles data?", isPresented: $confirmRemoveChronicles) {
+            Button("Remove", role: .destructive) { app.chronicles.removeChroniclesData(); app.brain.refreshHeadline() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Smith signs out of Chronicles and deletes your tasks, events, goals, habits, bill dates and journal summaries from this device. What Smith knows about you, conversation summaries, letters and settings stay. Connect or import again to bring Chronicles back.")
+        }
         .background {
             // Esc: stop and start again
             Button("") { app.stopAll() }.keyboardShortcut(.cancelAction).opacity(0).accessibilityHidden(true)
         }
+    }
+
+    /// Letters, Goals, Me, Today's details and Settings: full-width pages under the tabs.
+    @ViewBuilder private var pageContent: some View {
+        Group {
+            switch app.page {
+            case .letters: LettersView(compact: compact)
+            case .today: TodaySheet()
+            case .goals: GoalsSheet()
+            case .me: AboutYouView()
+            case .settings: SettingsView()
+            case .home: EmptyView()
+            }
+        }
+        .environment(\.pageClose, { app.page = .home })
+        .frame(maxWidth: Self.contentWidth)
+        .padding(.horizontal, sidePadding).padding(.top, compact ? 14 : 26).padding(.bottom, compact ? 12 : 24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
     private func send() {
@@ -63,103 +104,237 @@ struct HomeView: View {
 
     // MARK: top
 
+    /// Content width, shared by the top row, the stats card and the typing box so their edges line up.
+    static let contentWidth: CGFloat = 1040
+    private var sidePadding: CGFloat { compact ? 18 : 40 }
+
     private var topBar: some View {
-        VStack(spacing: 14) {
-            HStack {
-                Text(Self.dateLine()).font(Theme.rounded(13)).foregroundStyle(Theme.dim)
-                Spacer()
+        VStack(spacing: compact ? 20 : 46) {
+            HStack(spacing: 12) {
+                tabs
+                Spacer(minLength: 8)
                 if app.showChat {
                     Button("Start over") { app.startOver() }.buttonStyle(.plain).font(Theme.rounded(13, .medium)).foregroundStyle(Theme.dim)
                         .help("Clear this chat. Nothing from it is kept.")
                     Button("Done") { app.endConversation() }.buttonStyle(.plain).font(Theme.rounded(13, .medium)).foregroundStyle(Theme.dim)
+                        .padding(.trailing, 6)
                 }
-                if app.chronicles.isUnlocked {
-                    Button { app.chronicles.lock() } label: { Image(systemName: "lock").foregroundStyle(Theme.dim) }
-                        .buttonStyle(.plain).help("Lock")
-                }
-                Button { app.sheet = .settings } label: { Image(systemName: "gearshape").foregroundStyle(Theme.dim) }.buttonStyle(.plain)
+                chroniclesPill
+                gearMenu
             }
-            if !app.showChat { chips }
-        }
-        .padding(.horizontal, 22).padding(.top, compact ? 14 : 24)
-    }
-
-    static func dateLine() -> String {
-        let f = DateFormatter(); f.dateFormat = "d MMMM, EEEE"; f.locale = Locale(identifier: "en_GB")
-        return f.string(from: Date())
-    }
-
-    private var chips: some View {
-        let o = app.brain.context().overview
-        // The next event still to come today (earlier ones have passed).
-        let nowHM = Date().formatted(.verbatim("\(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits)", timeZone: .current, calendar: .current))
-        let next = o?.events.first { !$0.allDay && ($0.endTime ?? $0.time ?? "") >= nowHM }
-        let behind = app.store.snapshot.flatMap { Freshness.daysBehind(exportedAt: $0.exportedAt, today: Day.key()) }
-        let row = HStack(spacing: 10) {
-                GlassChip(value: next.map { $0.time ?? "All day" } ?? "—", label: next.map { String($0.title.prefix(14)) } ?? ((o?.events.isEmpty ?? true) ? "No events" : "No more events"))
-                GlassChip(value: o.map { "\($0.openTasksToday)" } ?? "—", label: "Tasks today")
-                GlassChip(value: app.weather.report?.chip ?? "—", label: app.weather.report?.description ?? "Weather")
-                TimelineView(.everyMinute) { tl in
-                    GlassChip(value: tl.date.formatted(date: .omitted, time: .shortened), label: "Time")
-                }
-                if let snap = app.store.snapshot {
-                    Menu {
-                        Button("Import now") { importing = true }
-                        Button("Sync now") { Task { await app.sync.syncNow() } }
-                        Button("Not today") { app.store.updateLocalSettings { $0.freshness.snoozedDay = Day.key() } }
-                    } label: {
-                        GlassChip(value: snap.exportedAt.formatted(.dateTime.month(.abbreviated).day()),
-                                  label: "Data as of", tint: behind == nil ? nil : Theme.amber)
-                    }
-                    .menuStyle(.button).buttonStyle(.plain)
-                } else {
-                    Button { importing = true } label: { GlassChip(value: "Import", label: "Chronicles", tint: Theme.amber) }.buttonStyle(.plain)
-                }
+            if app.page == .home && !app.showChat && !app.store.settings.statsHidden {
+                // Tap the card for the whole day
+                statsCard.contentShape(Rectangle()).onTapGesture { app.page = .today }
+                    .help("Open today's details")
             }
-            .padding(.horizontal, 2)
-        // Centred when it fits; scrolls sideways on narrow screens.
-        return ViewThatFits(in: .horizontal) {
-            row
-            ScrollView(.horizontal, showsIndicators: false) { row }
         }
+        .frame(maxWidth: Self.contentWidth)
+        .padding(.horizontal, sidePadding).padding(.top, compact ? 12 : 22)
         .frame(maxWidth: .infinity)
+    }
+
+    /// Today is home; Goals, Me and Letters open over it.
+    private var tabs: some View {
+        HStack(spacing: compact ? 16 : 30) {
+            tab("Today", selected: app.page == .home || app.page == .today) { app.page = .home }
+            tab("Goals", selected: app.page == .goals) { app.page = .goals }
+            tab("Me", selected: app.page == .me) { app.page = .me }
+            tab("Letters", selected: app.page == .letters) { app.page = .letters }
+            if app.page == .home && !app.showChat { statsMenu }
+        }
+    }
+
+    /// One button: hide or show the stats card.
+    private var statsMenu: some View {
+        let hidden = app.store.settings.statsHidden
+        return Button { app.store.updateLocalSettings { $0.statsHidden.toggle() } } label: {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(hidden ? "SHOW STATS" : "HIDE STATS").font(Theme.rounded(compact ? 11 : 13, .medium)).tracking(2.2)
+                    .foregroundStyle(Theme.dim)
+                Capsule().fill(.clear).frame(height: 2.5)
+            }
+            .fixedSize()
+            .padding(.top, 10)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func tab(_ title: String, selected: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(title.uppercased()).font(Theme.rounded(compact ? 11 : 13, .medium)).tracking(2.2)
+                    .foregroundStyle(selected ? Theme.text : Theme.dim)
+                Capsule().fill(selected ? Theme.teal : .clear).frame(height: 2.5)
+            }
+            .fixedSize()
+            .padding(.top, 10)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var chroniclesPill: some View {
+        let connected = app.chronicles.isUnlocked
+        return Button {
+            if connected { app.sheet = .settings } else { app.chronicles.beginSetup() }
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "book.closed").foregroundStyle(Theme.teal)
+                if !compact { Text(connected ? "Chronicles connected" : "Connect to Chronicles").foregroundStyle(Theme.text) }
+                if connected { Circle().fill(Theme.teal).frame(width: 7, height: 7) }
+            }
+            .font(Theme.rounded(compact ? 13 : 15))
+            .padding(.horizontal, 16).frame(height: compact ? 36 : 44)
+            .background(Color.black.opacity(0.25), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(.white.opacity(0.13)))
+        }
+        .buttonStyle(.plain)
+        .help(connected ? "Signed in to Chronicles" : "Sign in with your Chronicles account")
+    }
+
+    /// Settings, the data (import, sync) and the account (lock, sign out).
+    private var gearMenu: some View {
+        Menu {
+            Button { app.sheet = .settings } label: { Label("Settings", systemImage: "gearshape") }
+            Divider()
+            Button { importing = true } label: { Label("Import now", systemImage: "square.and.arrow.down") }
+            Button { Task { await app.sync.syncNow(); if app.chronicles.isUnlocked { await app.chronicles.refresh() } } } label: {
+                Label("Sync now", systemImage: "arrow.triangle.2.circlepath")
+            }
+            Divider()
+            Button { app.chronicles.lock() } label: { Label("Lock", systemImage: "lock") }
+            Button { app.chronicles.signOut() } label: { Label("Sign out", systemImage: "rectangle.portrait.and.arrow.right") }
+            Divider()
+            Button(role: .destructive) { confirmRemoveChronicles = true } label: {
+                Label("Remove Chronicles data…", systemImage: "trash")
+            }
+        } label: {
+            Image(systemName: "gearshape").font(.system(size: compact ? 15 : 18)).foregroundStyle(Theme.soft)
+                .frame(width: compact ? 36 : 44, height: compact ? 36 : 44)
+                .background(Color.black.opacity(0.25), in: Circle())
+                .overlay(Circle().stroke(.white.opacity(0.13)))
+        }
+        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize().help("Settings and account")
+    }
+
+    /// One glass card: the time with date and weather, events, tasks and priorities.
+    private var statsCard: some View {
+        let o = app.brain.context().overview
+        let nowHM = Date().formatted(.verbatim("\(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits)", timeZone: .current, calendar: .current))
+        let remaining = o?.events.filter { $0.allDay || ($0.endTime ?? $0.time ?? "") >= nowHM } ?? []
+        let next = remaining.first { !$0.allDay }
+        let overdue = o?.overdue.count ?? 0
+        let tasks = o.map { $0.openTasksToday + overdue }
+
+        // The date ("Wed" over a small "Nov 25"), then the time with the weather under it
+        let date = TimelineView(.everyMinute) { tl in
+            stat(value: tl.date.formatted(.dateTime.weekday(.abbreviated)),
+                 label: Text(tl.date.formatted(.dateTime.month(.abbreviated).day())))
+        }
+        let clock = TimelineView(.everyMinute) { tl in
+            let full = tl.date.formatted(date: .omitted, time: .shortened)
+            // "11:27 PM" (macOS puts a narrow no-break space before PM)
+            let parts = full.split(maxSplits: 1, whereSeparator: { $0.isWhitespace }).map(String.init)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Text(parts.first ?? full).font(Theme.rounded(compact ? 18 : 21, .light))
+                    if parts.count > 1 { Text(parts[1]).font(Theme.rounded(compact ? 9 : 11)).foregroundStyle(Theme.dim) }
+                }
+                .foregroundStyle(Theme.text)
+                HStack(spacing: 8) {
+                    if let w = app.weather.report {
+                        Image(systemName: Self.weatherSymbol(w.description)).foregroundStyle(Theme.teal)
+                        Text("\(w.chip) \(w.description)")
+                    } else {
+                        Text("Time")
+                    }
+                }
+                .font(Theme.rounded(compact ? 11 : 13)).foregroundStyle(Theme.dim).lineLimit(1).minimumScaleFactor(0.85)
+            }
+        }
+        let allDay = remaining.first { $0.allDay }
+        let eventLabel = next.map { "Next: \($0.time ?? "") \($0.title)" }
+            ?? allDay.map { "All day: \($0.title)" }
+            ?? ((o?.events.isEmpty ?? true) ? "No events today" : "No more events")
+        let events = stat(value: "\(remaining.count)", label: Text(eventLabel))
+        let taskStat = stat(value: tasks.map(String.init) ?? "—", tint: overdue > 0 ? Theme.amber : nil,
+                            label: overdue > 0 ? Text("Tasks · ") + Text("\(overdue) overdue").foregroundColor(Theme.amber) : Text("Tasks today"))
+        let priorities = stat(value: o.map { "\($0.priorities.count)" } ?? "—", label: Text("Priorities"))
+        let divider = Rectangle().fill(.white.opacity(0.09)).frame(width: 1, height: compact ? 30 : 38)
+
+        return ViewThatFits(in: .horizontal) {
+            HStack(spacing: 0) {
+                // The date and time take just the room they need; the counts share the rest
+                date.fixedSize().padding(.trailing, 28)
+                divider
+                clock.fixedSize().padding(.horizontal, 28)
+                divider
+                events.frame(maxWidth: .infinity, alignment: .leading).padding(.leading, 28).padding(.trailing, 10)
+                divider
+                taskStat.frame(maxWidth: .infinity, alignment: .leading).padding(.leading, 28).padding(.trailing, 10)
+                divider
+                priorities.frame(maxWidth: .infinity, alignment: .leading).padding(.leading, 28)
+            }
+            // Narrow (the floating panel, a small window): two by two
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 120), alignment: .leading)], alignment: .leading, spacing: 16) {
+                date; clock; events; taskStat; priorities
+            }
+        }
+        .padding(.horizontal, compact ? 18 : 32).padding(.vertical, compact ? 12 : 18)
+        .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .background(.ultraThinMaterial.opacity(0.5), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(.white.opacity(0.09)))
+    }
+
+    private func stat(value: String, tint: Color? = nil, label: Text) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(value).font(Theme.rounded(compact ? 18 : 21, .light)).foregroundStyle(tint ?? Theme.text)
+            label.font(Theme.rounded(compact ? 11 : 13)).foregroundStyle(Theme.dim).lineLimit(1).minimumScaleFactor(0.85)
+        }
+    }
+
+    static func weatherSymbol(_ description: String) -> String {
+        switch description.lowercased() {
+        case "clear": "sun.max"
+        case "mostly clear", "partly cloudy": "cloud.sun"
+        case "foggy": "cloud.fog"
+        case "drizzle", "rain", "showers": "cloud.rain"
+        case "snow", "snow showers": "cloud.snow"
+        case "thunderstorms": "cloud.bolt"
+        default: "cloud"
+        }
     }
 
     // MARK: orb and corners
 
-    private var orbArea: some View {
+    /// The orb, any notice, and the hint under it.
+    private var orbBlock: some View {
         VStack(spacing: 6) {
-            OrbView(mode: orbMode, level: app.voice.level, size: app.showChat ? (compact ? 56 : 72) : (compact ? 84 : 112))
+            OrbView(mode: orbMode, level: app.voice.level, size: app.showChat ? (compact ? 56 : 72) : (compact ? 80 : 112))
                 .contentShape(Circle())
                 .onTapGesture { app.orbTapped() }
                 .onLongPressGesture(minimumDuration: 0.5) { app.orbHeld() }
-            // Stop: listening (nothing is sent), speaking, or an answer on its way (Esc does the same)
-            if app.isBusy {
-                Button { app.stopAll() } label: {
-                    Label("Stop", systemImage: "stop.circle").font(Theme.rounded(12, .medium))
-                        .padding(.horizontal, 12).padding(.vertical, 5).background(Color.black.opacity(0.55), in: Capsule())
-                }
-                .buttonStyle(.plain).foregroundStyle(Theme.soft).help("Stop (Esc)")
+            if let notice = app.safety.notice {
+                Text(notice).font(Theme.rounded(12)).foregroundStyle(Theme.amber).multilineTextAlignment(.center)
+                    .padding(.horizontal, 24)
             }
-            Caps(hint, size: 8.5, color: Theme.faint)
-            InputBar(text: Bindable(app).draft, prompt: app.showChat ? "Talk or ask something…" : "Explain in detail") { send() }
-                .padding(.top, 10)
+            Caps(hint, size: compact ? 9 : 11.5, color: Theme.dim).padding(.top, 8)
+        }
+    }
+
+    /// The typing box at the bottom.
+    private var inputArea: some View {
+        VStack(spacing: 6) {
+            InputBar(text: Bindable(app).draft, prompt: app.showChat ? "Talk or ask something…" : "Explain in detail", sidePadding: sidePadding) { send() }
+                .padding(.top, 22)
             if app.showChat {
                 Caps("Anything you type or say here is sent to Claude", size: 7.5, color: Theme.faint).padding(.top, 2)
             }
-            HStack {
-                corner("Today", .today)
-                corner("Goals", .goals)
-                Spacer()
-                corner("Me", .me)
-                corner("Letters", .letters)
-            }
-            .padding(.horizontal, 22).padding(.top, 4).padding(.bottom, compact ? 10 : 18)
+            Color.clear.frame(height: compact ? 12 : 22)
         }
     }
 
     private var hint: String {
-        if app.voice.state == .listening { return "Listening · tap when you're done · Esc to cancel" }
+        if app.voice.state == .listening { return "Tap to finish" }
         if app.brain.conversationMode { return "Conversation · say \"that's all\" to finish" }
         return "Tap to talk · hold for conversation"
     }
@@ -170,11 +345,6 @@ struct HomeView: View {
         case .speaking: .speaking
         case .idle: app.brain.isThinking ? .thinking : .idle
         }
-    }
-
-    private func corner(_ title: String, _ sheet: AppModel.Sheet) -> some View {
-        Button { app.sheet = sheet } label: { Caps(title, size: 10, color: Theme.dim).padding(.horizontal, 8).padding(.vertical, 6) }
-            .buttonStyle(.plain)
     }
 
     private func banner(_ msg: String) -> some View {
@@ -196,6 +366,10 @@ struct ChatView: View {
     var body: some View {
         let brain = app.brain
         VStack(spacing: 0) {
+            // An urgent sign: help stays pinned at the top while the chat goes on
+            if app.safety.pinned {
+                ResourcesCard(kind: app.safety.lastKind, urgent: true, compact: true).padding(.top, 6)
+            }
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
@@ -211,7 +385,7 @@ struct ChatView: View {
                 .onChange(of: brain.lines) { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
             }
         }
-        .sheet(item: $editing) { f in FactEditor(fact: f) }
+        .sheet(item: $editing) { f in FactEditor(fact: f).environment(\.pageClose, nil) }
     }
 
     @ViewBuilder private func row(_ line: ChatLine) -> some View {
@@ -256,6 +430,8 @@ struct ChatView: View {
             }
         case .note:
             Caps(line.text, size: 9, color: Theme.faint)
+        case .resources:
+            ResourcesCard(kind: line.kind, urgent: app.safety.pinned)
         }
     }
 
@@ -276,6 +452,7 @@ struct InputBar: View {
     @Environment(AppModel.self) private var app
     @Binding var text: String
     let prompt: String
+    var sidePadding: CGFloat = 40
     let onSend: () -> Void
 
     var body: some View {
@@ -286,26 +463,41 @@ struct InputBar: View {
                 heard
             } else {
                 TextField("", text: $text, prompt: Text(prompt).foregroundStyle(Theme.faint), axis: .vertical)
-                    .textFieldStyle(.plain).font(Theme.rounded(15)).foregroundStyle(Theme.soft)
+                    .textFieldStyle(.plain).font(Theme.rounded(17)).foregroundStyle(Theme.soft)
                     .lineSpacing(4).lineLimit(1...16)
+                    .focusEffectDisabled()
                     .onSubmit(onSend)
             }
             if !text.isEmpty && !listening {
                 Button(action: onSend) { Image(systemName: "arrow.up.circle.fill").font(.system(size: 20)).foregroundStyle(Theme.violet) }
                     .buttonStyle(.plain)
             }
+            // Stop: listening, speaking or an answer on its way (Esc does the same)
+            if app.isBusy {
+                Button { app.stopAll() } label: {
+                    Image(systemName: "stop.circle.fill").font(.system(size: 19)).foregroundStyle(Theme.rose)
+                }
+                .buttonStyle(.plain).help("Stop (Esc)").transition(.opacity)
+            }
+            // Talk: the same as tapping the orb
+            Button { app.orbTapped() } label: {
+                Image(systemName: listening ? "mic.fill" : "mic").font(.system(size: 17))
+                    .foregroundStyle(listening ? Theme.teal : Theme.dim)
+            }
+            .buttonStyle(.plain).help(listening ? "Finish talking" : "Talk")
             Button { app.store.updateSettings { $0.muted.toggle() } } label: {
                 Image(systemName: app.store.settings.muted ? "speaker.slash" : "speaker.wave.2").foregroundStyle(Theme.dim)
             }
             .buttonStyle(.plain).help(app.store.settings.muted ? "Text only (tap to hear replies)" : "Replies are spoken (tap for text only)")
         }
-        .padding(.horizontal, 18).padding(.vertical, 12)
+        .padding(.horizontal, 22).padding(.vertical, 16)
         .fixedSize(horizontal: false, vertical: true)
-        .background(Color.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(listening ? Theme.violet.opacity(0.45) : .white.opacity(0.07)))
-        .frame(maxWidth: 680)
-        .padding(.horizontal, 18)
+        .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(listening ? Theme.teal.opacity(0.45) : .white.opacity(0.1)))
+        .frame(maxWidth: HomeView.contentWidth)
+        .padding(.horizontal, sidePadding)
         .animation(.easeOut(duration: 0.2), value: listening)
+        .animation(.easeOut(duration: 0.2), value: app.isBusy)
     }
 
     /// The live transcript in the box: one line to start, growing with what

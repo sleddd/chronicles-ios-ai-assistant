@@ -147,11 +147,26 @@ struct AboutYouView: View {
     var body: some View {
         @Bindable var store = app.store
         GlassSheet(title: "About you") {
-            TextField("", text: $search, prompt: Text("Search").foregroundStyle(Theme.faint)).textFieldStyle(.plain)
-                .padding(10).background(.ultraThinMaterial, in: Capsule())
+            HStack(spacing: 12) {
+                Image(systemName: "magnifyingglass").foregroundStyle(Theme.dim)
+                TextField("", text: $search, prompt: Text("Search what Smith knows").foregroundStyle(Theme.faint))
+                    .textFieldStyle(.plain).focusEffectDisabled()
+            }
+            .font(Theme.rounded(14))
+            .padding(.horizontal, 16).frame(height: 40)
+            .background(Color.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(.white.opacity(0.09)))
             HStack {
-                Button { adding = true } label: { Label("Add something about me", systemImage: "plus") }
-                    .buttonStyle(.plain).font(Theme.rounded(13, .medium)).foregroundStyle(Theme.violet)
+                Button { adding = true } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "plus").foregroundStyle(Theme.teal)
+                        Text("Add something about me").foregroundStyle(Theme.text)
+                    }
+                    .font(Theme.rounded(14, .medium)).padding(.horizontal, 16).frame(height: 38)
+                    .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(.white.opacity(0.13)))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
                 Spacer()
                 Toggle("Learning", isOn: Binding(get: { !store.aboutYou.paused }, set: { store.aboutYou.paused = !$0 }))
                     .toggleStyle(.switch).font(Theme.rounded(12)).fixedSize()
@@ -162,7 +177,7 @@ struct AboutYouView: View {
                 let facts = store.aboutYou.facts.filter { $0.category == c && (search.isEmpty || $0.text.localizedCaseInsensitiveContains(search)) }
                 if !facts.isEmpty {
                     SectionLabel(c.label)
-                    VStack(spacing: 8) { ForEach(facts) { f in factRow(f) } }
+                    VStack(spacing: 14) { ForEach(facts) { f in factRow(f) } }
                 }
             }
             if store.aboutYou.facts.isEmpty {
@@ -197,9 +212,9 @@ struct AboutYouView: View {
                     .task(id: u.id) { try? await Task.sleep(for: .seconds(5)); if undo?.id == u.id { undo = nil } }
             }
         }
-        .sheet(item: $editing) { FactEditor(fact: $0) }
-        .sheet(isPresented: $adding) { FactEditor(fact: nil) }
-        .sheet(item: $editingSummary) { s in SummaryEditor(summary: s) }
+        .sheet(item: $editing) { FactEditor(fact: $0).environment(\.pageClose, nil) }
+        .sheet(isPresented: $adding) { FactEditor(fact: nil).environment(\.pageClose, nil) }
+        .sheet(item: $editingSummary) { s in SummaryEditor(summary: s).environment(\.pageClose, nil) }
         .alert("Clear everything Smith knows about you?", isPresented: $confirmClear) {
             Button("Clear", role: .destructive) { store.aboutYou.clearAll(); store.clearConversations() }
             Button("Cancel", role: .cancel) {}
@@ -209,8 +224,8 @@ struct AboutYouView: View {
     private func factRow(_ f: Fact) -> some View {
         @Bindable var store = app.store
         return HStack(alignment: .top, spacing: 10) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(f.text).font(Theme.rounded(15, .regular))
+            VStack(alignment: .leading, spacing: 8) {
+                Text(f.text).font(Theme.rounded(14, .regular)).lineSpacing(3)
                 Caps("\(f.sourceLabel), \(f.updatedAt.formatted(.dateTime.day().month(.abbreviated)))", size: 8, color: Theme.faint)
                 if !f.confirmed {
                     HStack(spacing: 14) {
@@ -223,10 +238,11 @@ struct AboutYouView: View {
             Button { editing = f } label: { Image(systemName: "pencil") }.buttonStyle(.plain).foregroundStyle(Theme.dim)
             Button { undo = store.aboutYou.delete(f.id) } label: { Image(systemName: "trash") }.buttonStyle(.plain).foregroundStyle(Theme.dim)
         }
-        .padding(12)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .stroke(.white.opacity(f.confirmed ? 0.07 : 0.3), style: StrokeStyle(lineWidth: 1, dash: f.confirmed ? [] : [4, 4])))
+        .padding(.horizontal, 20).padding(.vertical, 16)
+        .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .background(.ultraThinMaterial.opacity(0.5), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
+            .stroke(.white.opacity(f.confirmed ? 0.09 : 0.3), style: StrokeStyle(lineWidth: 1, dash: f.confirmed ? [] : [4, 4])))
     }
 }
 

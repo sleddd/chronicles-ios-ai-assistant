@@ -159,7 +159,6 @@ final class SmithStore {
             incoming.smithVoiceID = settings.smithVoiceID
             incoming.henryVoiceID = settings.henryVoiceID
             incoming.macWakeWord = settings.macWakeWord
-            incoming.watchedFolderBookmark = settings.watchedFolderBookmark
             incoming.lastGreetingDay = settings.lastGreetingDay
             incoming.chroniclesEmail = settings.chroniclesEmail
             incoming.chroniclesServer = settings.chroniclesServer
@@ -184,6 +183,16 @@ final class SmithStore {
         let (merged, receipt) = SyncMerge.merge(syncPayload(), theirs)
         apply(merged)
         return receipt
+    }
+
+    /// Deletes only the Chronicles data kept here (the day's picture and the
+    /// journal summaries). Memory, conversation summaries, letters and settings stay.
+    func clearChroniclesData() {
+        EncryptedFile.delete("chronicles.smith")
+        EncryptedFile.delete("journal-vault.smith")
+        snapshot = nil; journal = []
+        lastSync = nil
+        updateLocalSettings { $0.chroniclesHome = nil }
     }
 
     /// Wipes everything Smith stores on this device.

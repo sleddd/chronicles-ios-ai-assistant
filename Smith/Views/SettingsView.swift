@@ -6,10 +6,10 @@ import SmithCore
 struct SettingsView: View {
     @Environment(AppModel.self) private var app
     @State private var apiKey = Keychain.apiKey ?? ""
-    @State private var pickFolder = false
     @State private var exportingBackup: SmithDataDocument?
     @State private var pairCode = ""
     @State private var confirmErase = false
+    @State private var confirmChroniclesReset = false
     @State private var newSample = ""
     @State private var elevenKey = ""
     @State private var elevenVoices: [ElevenLabs.Voice] = []
@@ -73,35 +73,19 @@ struct SettingsView: View {
                     } else { Text("Nothing imported yet.").foregroundStyle(Theme.dim) }
                     Button("Import Chronicles export…") { app.sheet = nil; NotificationCenter.default.post(name: .smithImport, object: nil) }
                         .buttonStyle(.plain).foregroundStyle(Theme.violet)
-                    Button(s.watchedFolderBookmark == nil ? "Choose a folder to watch…" : "Change watched folder…") { pickFolder = true }
-                        .buttonStyle(.plain).foregroundStyle(Theme.violet)
-                    Caps("In Chronicles: Settings → Data → Export All. Save it to the watched folder or share it to Smith.", size: 8, color: Theme.faint)
+                    Caps("In Chronicles: Settings → Data → Export All, then import the file here or share it to Smith.", size: 8, color: Theme.faint)
                 }
 
-                SectionLabel("Journal")
+                SectionLabel("Privacy")
                 GlassCard {
-                    Picker("Share with Smith", selection: binding(\.journalMode)) { ForEach(JournalShareMode.allCases, id: \.self) { Text($0.label).tag($0) } }
-                    Text("What would be sent:").font(Theme.rounded(12)).foregroundStyle(Theme.dim)
-                    Text(store.journalDigestText ?? "Nothing.").font(Theme.rounded(13)).padding(8).background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
-                    Caps(OnDevice.unavailableReason ?? "Journal entries are summarized on this device and the text is discarded.", size: 8, color: Theme.faint)
-                    if let topics = store.snapshot?.topics, !topics.isEmpty {
-                        Text("Never mention").font(Theme.rounded(13, .medium)).padding(.top, 6)
-                        ForEach(topics.sorted { $0.value < $1.value }, id: \.key) { id, name in
-                            Toggle(name, isOn: Binding(get: { s.neverMentionTopics.contains(id) },
-                                                       set: { on in store.updateSettings { if on { $0.neverMentionTopics.insert(id) } else { $0.neverMentionTopics.remove(id) } } }))
-                        }
+                    Text("What Smith may see is set in Chronicles: Settings → In-App AI. Topics and features you keep from AI there, and entries marked Hide from AI, never reach Smith — live or from an export.")
+                        .font(Theme.rounded(13)).foregroundStyle(Theme.dim).fixedSize(horizontal: false, vertical: true)
+                    let hidden = app.chronicles.hiddenTopicIDs.compactMap { store.snapshot?.topics[String($0)] }.sorted()
+                    if app.chronicles.isUnlocked {
+                        Text(hidden.isEmpty ? "No topics are kept from AI." : "Kept from AI: " + hidden.joined(separator: ", "))
+                            .font(Theme.rounded(13, .medium))
                     }
-                }
-
-                if let bills = store.snapshot?.bills, !bills.isEmpty {
-                    SectionLabel("Bills")
-                    GlassCard {
-                        Caps("Smith knows names and due dates only, never amounts. Private bills are called \"a bill\".", size: 8, color: Theme.faint)
-                        ForEach(bills) { b in
-                            Toggle("Keep \(b.name) private", isOn: Binding(get: { s.privateBills.contains(b.id) },
-                                set: { on in store.updateSettings { if on { $0.privateBills.insert(b.id) } else { $0.privateBills.remove(b.id) } } }))
-                        }
-                    }
+                    Caps("Journal entries are summarized on this device; the text is never sent. Bill amounts are never kept.", size: 8, color: Theme.faint)
                 }
             }
             Group {
@@ -135,14 +119,23 @@ struct SettingsView: View {
             #endif
             Group {
                 SectionLabel("Erase")
-                Button("Erase everything Smith stores on this device") { confirmErase = true }.buttonStyle(.plain).foregroundStyle(Theme.rose)
+                GlassCard {
+                    Button("Remove Chronicles data from this device") { confirmChroniclesReset = true }
+                        .buttonStyle(.plain).foregroundStyle(Theme.rose)
+                    Caps("Signs out and deletes the Chronicles data Smith keeps here. What Smith knows about you, conversation summaries and letters stay.", size: 8, color: Theme.faint)
+                    Button("Erase everything Smith stores on this device") { confirmErase = true }.buttonStyle(.plain).foregroundStyle(Theme.rose)
+                        .padding(.top, 6)
+                }
             }
-        }
-        .fileImporter(isPresented: $pickFolder, allowedContentTypes: [.folder]) { r in
-            if case .success(let url) = r, let b = Importer.bookmark(for: url) { store.updateLocalSettings { $0.watchedFolderBookmark = b } }
         }
         .fileExporter(isPresented: Binding(get: { exportingBackup != nil }, set: { if !$0 { exportingBackup = nil } }),
                       document: exportingBackup, contentType: .smithData, defaultFilename: "Smith backup") { _ in exportingBackup = nil }
+        .alert("Remove Chronicles data?", isPresented: $confirmChroniclesReset) {
+            Button("Remove", role: .destructive) { app.chronicles.removeChroniclesData(); app.brain.refreshHeadline() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Smith signs out of Chronicles and deletes your tasks, events, goals, habits, bill dates and journal summaries from this device. What Smith knows about you, conversation summaries, letters and settings stay. Connect or import again to bring Chronicles back.")
+        }
         .alert("Erase everything?", isPresented: $confirmErase) {
             Button("Erase", role: .destructive) { store.eraseAll(); app.brain.refreshHeadline() }
             Button("Cancel", role: .cancel) {}
@@ -308,7 +301,7 @@ struct SettingsView: View {
             if c.isUnlocked {
                 HStack(spacing: 18) {
                     Button(c.syncing ? "Syncing…" : "Sync now") { Task { await c.refresh() } }.disabled(c.syncing)
-                    Button("Lock now") { app.sheet = nil; c.lock() }
+                    Button("Lock and sign out") { app.sheet = nil; c.lock() }
                 }.buttonStyle(.plain).foregroundStyle(Theme.violet)
             }
             if ChroniclesConnection.quickUnlockAvailable {
@@ -335,7 +328,7 @@ struct SettingsView: View {
         HStack {
             Picker(title, selection: selection) {
                 Text("Best available").tag(String?.none)
-                ForEach(VoiceIO.choosableVoices, id: \.identifier) { v in Text("\(v.name) (\(v.quality.label))").tag(Optional(v.identifier)) }
+                ForEach(VoiceIO.choosableVoices, id: \.identifier) { v in Text(v.name.contains("(") ? v.name : "\(v.name) (\(v.quality.label))").tag(Optional(v.identifier)) }
             }
             Button { app.voice.preview(.apple(selection.wrappedValue), text: sample) } label: { Image(systemName: "play.circle") }.buttonStyle(.plain)
         }

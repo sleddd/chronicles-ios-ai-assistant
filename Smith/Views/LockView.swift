@@ -60,9 +60,8 @@ struct LockView: View {
                 .frame(maxWidth: 340)
 
                 if app.store.settings.chroniclesEmail == nil {
-                    Text("First switch on the Chronicles AI app in Chronicles: Settings → In-App AI.")
+                    Text("Smith works with your Chronicles account. First switch on the Chronicles AI app in Chronicles: Settings → In-App AI.")
                         .font(Theme.rounded(12)).foregroundStyle(Theme.faint).multilineTextAlignment(.center).padding(.horizontal, 30)
-                    Button("Not now") { c.cancelSetup() }.buttonStyle(.plain).font(Theme.rounded(13, .medium)).foregroundStyle(Theme.dim)
                 }
                 Spacer()
             }

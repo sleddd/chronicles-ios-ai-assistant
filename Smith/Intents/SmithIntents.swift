@@ -75,7 +75,7 @@ struct LetterFromHenryIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        let text = try await HenryWriter.write(store: AppModel.shared.store, message: nil)
+        let text = try await HenryWriter.write(store: AppModel.shared.store, message: nil).text
         return .result(dialog: IntentDialog(stringLiteral: text))
     }
 }

@@ -47,7 +47,6 @@ Smith keeps its own permanent **SwiftData** database on each device. Smith alway
 - **Import…** in Settings, or ⌘I on the Mac, opens the file picker.
 - On the Mac, you can drag the file onto the window or the menu bar orb.
 - On the iPad, you can use **Share → Smith** from Files, or AirDrop. Smith registers itself as an app that can open `.json` files.
-- The **watched folder** is optional. If you choose a folder such as `iCloud Drive/Smith/` once, Smith imports any newer export it finds there when it opens. This uses the file picker and a bookmark, because a free Personal Team can't use the iCloud container entitlement.
 
 **How an import updates the database**
 - **Matching:** each record is matched by its Chronicles ID and *upserted*: new items are added and changed ones are updated.

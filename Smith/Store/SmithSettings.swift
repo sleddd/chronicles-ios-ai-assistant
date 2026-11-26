@@ -37,6 +37,8 @@ struct SmithSettings: Codable, Equatable {
     var neverMentionTopics: Set<String> = []
     /// Bill ids named just "a bill".
     var privateBills: Set<String> = []
+    /// Privacy moved to Chronicles: Smith's own choices above were cleared once.
+    var privacyFromChronicles = false
 
     var memoryEnabled = true
     var concerns = ConcernSettings()
@@ -63,10 +65,12 @@ struct SmithSettings: Codable, Equatable {
     /// Unlock with Face ID / Touch ID within the same Chronicles session.
     var quickUnlock = false
 
+    /// The stats card on the home screen can be hidden.
+    var statsHidden = false
+
     var macWakeWord = false
     var greetOnWake = true
     var lastGreetingDay: String?
-    var watchedFolderBookmark: Data?
 
     var updatedAt = Date.distantPast
 }

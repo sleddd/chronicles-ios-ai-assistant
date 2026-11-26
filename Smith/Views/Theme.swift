@@ -40,15 +40,16 @@ struct GlowBackground: View {
         TimelineView(.animation(minimumInterval: 1 / 20)) { tl in
             let t = tl.date.timeIntervalSinceReferenceDate
             let a = Float(sin(t / 7) * 0.12), b = Float(cos(t / 9) * 0.12), c = Float(sin(t / 11) * 0.1)
+            // Teal on the left, magenta on the right, violet above
             let glow1 = warm ? Theme.rose : Theme.violet
-            let glow2 = warm ? Theme.amber : (mood ? Theme.teal : Theme.blue)
+            let glow2 = warm ? Theme.amber : Theme.teal
             MeshGradient(width: 3, height: 3, points: [
                 [0, 0], [0.5 + a, 0], [1, 0],
                 [0, 0.5 + b], [0.5 + c, 0.45 + a], [1, 0.5 - b],
                 [0, 1], [0.5 - c, 1], [1, 1],
             ], colors: [
                 Theme.ink, glow1.opacity(0.35), Theme.ink,
-                glow2.opacity(0.22), Theme.ink, (warm ? Theme.rose : Theme.magenta).opacity(0.18),
+                glow2.opacity(warm ? 0.22 : 0.2), Theme.ink, (warm ? Theme.rose : Theme.magenta).opacity(warm ? 0.18 : 0.26),
                 Theme.ink, glow1.opacity(0.28), Theme.ink,
             ])
             .overlay(Theme.ink.opacity(0.35))
@@ -74,50 +75,78 @@ struct GlassChip: View {
     }
 }
 
-/// A glass sheet with a title, used for TODAY, GOALS, ME, LETTERS and Settings.
+/// Set when a screen is shown as a page in the main window (under the tabs);
+/// its close button goes back to Today instead of dismissing a sheet.
+private struct PageCloseKey: EnvironmentKey { static let defaultValue: (@MainActor () -> Void)? = nil }
+extension EnvironmentValues {
+    var pageClose: (@MainActor () -> Void)? {
+        get { self[PageCloseKey.self] }
+        set { self[PageCloseKey.self] = newValue }
+    }
+}
+
+/// A titled screen: Today, Goals, Me and Settings. In the main window it's a
+/// full-width page under the tabs; presented on its own (an editor) it's a glass sheet.
 struct GlassSheet<Content: View>: View {
     let title: String
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.pageClose) private var pageClose
     @ViewBuilder var content: Content
 
     var body: some View {
-        ZStack {
-            GlowBackground()
-            VStack(alignment: .leading, spacing: 0) {
+        if let pageClose {
+            VStack(alignment: .leading, spacing: 22) {
                 HStack {
-                    Caps(title, size: 12, color: Theme.text)
+                    Text(title.uppercased()).font(Theme.rounded(13, .semibold)).tracking(2.4).foregroundStyle(Theme.text)
                     Spacer()
-                    Button { dismiss() } label: {
-                        Image(systemName: "xmark").font(.system(size: 13, weight: .medium)).foregroundStyle(Theme.dim)
-                            .padding(10).background(.ultraThinMaterial, in: Circle())
-                    }.buttonStyle(.plain)
+                    Button { pageClose() } label: {
+                        Image(systemName: "xmark").font(.system(size: 15, weight: .medium)).foregroundStyle(Theme.soft)
+                            .frame(width: 44, height: 44).overlay(Circle().stroke(.white.opacity(0.13)))
+                    }
+                    .buttonStyle(.plain).help("Back to Today")
                 }
-                .padding(.horizontal, 24).padding(.top, 22).padding(.bottom, 12)
-                ScrollView { content.padding(.horizontal, 24).padding(.bottom, 32).frame(maxWidth: .infinity, alignment: .leading) }
+                ScrollView { VStack(alignment: .leading, spacing: 16) { content }.padding(.bottom, 32).frame(maxWidth: .infinity, alignment: .leading) }
+                    .scrollIndicators(.hidden)
             }
+            .foregroundStyle(Theme.text)
+        } else {
+            ZStack {
+                GlowBackground()
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack {
+                        Caps(title, size: 12, color: Theme.text)
+                        Spacer()
+                        Button { dismiss() } label: {
+                            Image(systemName: "xmark").font(.system(size: 13, weight: .medium)).foregroundStyle(Theme.dim)
+                                .padding(10).background(.ultraThinMaterial, in: Circle())
+                        }.buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 24).padding(.top, 22).padding(.bottom, 12)
+                    ScrollView { VStack(alignment: .leading, spacing: 16) { content }.padding(.horizontal, 24).padding(.bottom, 32).frame(maxWidth: .infinity, alignment: .leading) }
+                }
+            }
+            .environment(\.colorScheme, .dark)
+            .foregroundStyle(Theme.text)
+            #if os(macOS)
+            .frame(minWidth: 460, minHeight: 560)
+            #endif
         }
-        .environment(\.colorScheme, .dark)
-        .foregroundStyle(Theme.text)
-        #if os(macOS)
-        .frame(minWidth: 460, minHeight: 560)
-        #endif
     }
 }
 
 struct SectionLabel: View {
     let text: String
     init(_ text: String) { self.text = text }
-    var body: some View { Caps(text, size: 10).padding(.top, 18).padding(.bottom, 6) }
+    var body: some View { Caps(text, size: 11).padding(.top, 34).padding(.bottom, 4) }
 }
 
 struct GlassCard<Content: View>: View {
     @ViewBuilder var content: Content
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) { content }
-            .padding(14)
+        VStack(alignment: .leading, spacing: 18) { content }
+            .padding(.horizontal, 26).padding(.vertical, 24)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(.white.opacity(0.07)))
+            .smithCard(radius: 20)
     }
 }
 
@@ -158,4 +187,14 @@ func emoteText(_ s: String, emote: Color) -> Text {
         rest = rest[r.upperBound...]
     }
     return out + Text(rest)
+}
+
+extension View {
+    /// The glass card used on the home and letters pages: faint fill, hairline edge.
+    func smithCard(radius: CGFloat = 24) -> some View {
+        self
+            .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .background(.ultraThinMaterial.opacity(0.5), in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).stroke(.white.opacity(0.09)))
+    }
 }

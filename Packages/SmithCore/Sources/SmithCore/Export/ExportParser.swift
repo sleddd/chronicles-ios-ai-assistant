@@ -35,7 +35,12 @@ public enum ExportParser {
         guard let exportedAt = root["exportedAt"]?.string.flatMap(parseISO) else { throw ParseError.missingDate }
 
         var snap = ChroniclesSnapshot(exportedAt: exportedAt)
-        let settings = root["settings"] ?? [:]
+        var settings = root["settings"] ?? [:]
+        // What the account keeps from AI in Chronicles (Settings → In-App AI) is
+        // left out of an export import exactly as it is from the live connection
+        let kept = ChroniclesLiveSync.keptFromAI(settings.object ?? [:])
+        if kept.features.contains("habits"), case .object(var o) = settings { o["habitLog"] = nil; settings = .object(o) }
+        if kept.features.contains("vision"), case .object(var o) = settings { o["goalCategories"] = nil; settings = .object(o) }
         snap.displayName = settings["displayName"]?.string
         snap.timeZone = settings["timezone"]?.string
 
@@ -51,6 +56,9 @@ public enum ExportParser {
         for e in root["entries"]?.array ?? [] {
             guard let id = idString(e["id"]) else { continue }
             let meta = e["metadata"] ?? [:]
+            // Hidden from AI (the entry's own switch or a topic on the list): never taken
+            if meta["_aiHidden"]?.bool == true { continue }
+            if let t = meta["_taxonomyId"]?.int ?? meta["_taxonomyId"]?.string.flatMap(Int.init), kept.topics.contains(t) { continue }
             let cf = meta["_customFields"] ?? [:]
             let topicID = idString(meta["_taxonomyId"])
             let topicName = topicID.flatMap { snap.topics[$0] }
@@ -133,7 +141,7 @@ public enum ExportParser {
 
         // Dose logs from the last 60 days.
         let cutoff = Day.addDays(Day.key(for: now), -60)
-        for l in root["medicationDoseLogs"]?.array ?? [] {
+        for l in kept.features.contains("doses") ? [] : root["medicationDoseLogs"]?.array ?? [] {
             guard let date = day(l["date"]), date >= cutoff, let med = idString(l["medicationPostId"]) else { continue }
             snap.doseLogs.append(DoseLog(date: date, medicationID: med,
                                          scheduledTime: String((l["scheduledTime"]?.string ?? "").prefix(5)),
@@ -153,7 +161,7 @@ public enum ExportParser {
                 VisionArea(name: $0, vision: nonEmpty(areas[$0.lowercased()]?["vision"]))
             })
 
-        snap.bills = bills(from: root["finance"] ?? [:])
+        snap.bills = kept.features.contains("bills") ? [] : bills(from: root["finance"] ?? [:])
         return Result(snapshot: snap, journal: journal)
     }
 

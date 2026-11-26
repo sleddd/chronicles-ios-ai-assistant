@@ -14,13 +14,32 @@ final class AppModel {
     let brain: SmithBrain
     let sync: SyncService
     let chronicles: ChroniclesConnection
+    let safety: SafetyCenter
 
     var importMessage: String?
     /// The typing box (shared, so a stopped or edited message can come back to it).
     var draft = ""
     var pendingOlderImport: URL?
     var showChat = false
-    var sheet: Sheet?
+    /// What fills the main window under the tabs.
+    enum Page: Equatable { case home, today, goals, me, letters, settings }
+    var page: Page = .home { didSet { if page != .letters { lettersBoxOpen = false } } }
+    /// The Letters page is showing the Letters box.
+    var lettersBoxOpen = false
+    /// Kept for callers that "open" a screen: it now shows as a page in the window.
+    var sheet: Sheet? {
+        get { nil }
+        set {
+            switch newValue {
+            case .none: page = .home
+            case .today: page = .today
+            case .goals: page = .goals
+            case .me: page = .me
+            case .letters: page = .letters
+            case .settings: page = .settings
+            }
+        }
+    }
     var deleteSourceOffer: URL?
 
     enum Sheet: String, Identifiable { case today, goals, me, letters, settings; var id: String { rawValue } }
@@ -30,13 +49,21 @@ final class AppModel {
         voice = VoiceIO()
         weather = WeatherService()
         chronicles = ChroniclesConnection(store: store)
-        brain = SmithBrain(store: store, voice: voice, weather: weather, chronicles: chronicles)
+        safety = SafetyCenter(chronicles: chronicles)
+        brain = SmithBrain(store: store, voice: voice, weather: weather, chronicles: chronicles, safety: safety)
         sync = SyncService(store: store)
         // The old built-in "Henry" becomes the assistant's own name (a name you chose stays)
         if !store.settings.lettersRenamed {
             store.updateSettings { s in
                 if s.henry.name == "Henry" { s.henry.name = "" }
                 s.lettersRenamed = true
+            }
+        }
+        // Privacy is controlled from Chronicles now; Smith's old duplicates are cleared once
+        if !store.settings.privacyFromChronicles {
+            store.updateSettings { s in
+                s.neverMentionTopics = []; s.privateBills = []; s.journalMode = .general
+                s.privacyFromChronicles = true
             }
         }
         applyVoiceSettings()
@@ -82,11 +109,8 @@ final class AppModel {
         brain.refreshHeadline()
         sync.start()
         chronicles.checkAutoLock()
-        if chronicles.isUnlocked {
-            await chronicles.refresh()
-        } else if chronicles.state == .notSetUp, let r = await Importer.checkWatchedFolder(store) {
-            importMessage = "Imported: " + r.text
-        }
+        await safety.refresh()
+        if chronicles.isUnlocked { await chronicles.refresh() }
         await weather.refresh(fahrenheit: store.settings.fahrenheit)
     }
 
@@ -107,6 +131,7 @@ final class AppModel {
     }
 
     func listenOnce() {
+        guard chronicles.isUnlocked else { return }
         Task {
             guard await voice.requestPermissions() else { importMessage = voice.permissionProblem; return }
             voice.listen { [weak self] text in
@@ -138,6 +163,7 @@ final class AppModel {
     }
 
     func typed(_ text: String) {
+        guard chronicles.isUnlocked else { return }
         showChat = true
         Task { await brain.send(text, spoken: false) }
     }
@@ -175,6 +201,7 @@ final class AppModel {
     }
 
     func morningBriefing() {
+        guard chronicles.isUnlocked else { return }
         showChat = true
         Task { await brain.briefing() }
     }

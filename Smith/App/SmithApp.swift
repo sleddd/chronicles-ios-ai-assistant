@@ -81,22 +81,17 @@ struct RootView: View {
     @Environment(\.scenePhase) private var phase
 
     var body: some View {
-        @Bindable var app = app
         Group {
-            if app.chronicles.isLocked { LockView() } else { HomeView() }
+            if app.chronicles.isLocked { LockView() }
+            else if app.safety.needsConsent { ConsentView() }
+            else { HomeView() }
         }
-            .sheet(item: $app.sheet) { sheet in
-                switch sheet {
-                case .today: TodaySheet()
-                case .goals: GoalsSheet()
-                case .me: AboutYouView()
-                case .letters: LettersView()
-                case .settings: SettingsView()
-                }
-            }
             .onOpenURL { app.openURL($0) }
             .onChange(of: phase) { _, p in if p == .active { Task { await app.becameActive() } } }
-            .onChange(of: app.chronicles.state) { _, _ in app.brain.refreshHeadline() }
+            .onChange(of: app.chronicles.state) { _, _ in
+                app.brain.refreshHeadline()
+                Task { await app.safety.refresh() }
+            }
             .onChange(of: app.chronicles.lastSync) { _, _ in app.brain.refreshHeadline() }
             .task { await app.becameActive() }
             .onReceive(NotificationCenter.default.publisher(for: .smithTalk)) { _ in app.listenOnce() }
@@ -109,20 +104,12 @@ struct RootView: View {
 struct PanelView: View {
     @Environment(AppModel.self) private var app
     var body: some View {
-        @Bindable var app = app
         Group {
-            if app.chronicles.isLocked { LockView(compact: true) } else { HomeView(compact: true) }
+            if app.chronicles.isLocked { LockView(compact: true) }
+            else if app.safety.needsConsent { ConsentView() }
+            else { HomeView(compact: true) }
         }
             .frame(width: 420, height: 640)
-            .sheet(item: $app.sheet) { sheet in
-                switch sheet {
-                case .today: TodaySheet()
-                case .goals: GoalsSheet()
-                case .me: AboutYouView()
-                case .letters: LettersView()
-                case .settings: SettingsView()
-                }
-            }
     }
 }
 
@@ -139,7 +126,10 @@ struct MenuBarContent: View {
             app.morningBriefing()
         }
         Button("Open window") { openWindow(id: "main"); NSApp.activate() }
-        if app.chronicles.isUnlocked { Button("Lock \(app.store.settings.name)") { app.chronicles.lock() } }
+        if app.chronicles.isUnlocked { Button("Lock \(app.store.settings.name) (sign out of Chronicles)") { app.chronicles.lock() } }
+        if app.chronicles.state == .notSetUp {
+            Button("Connect to Chronicles…") { openWindow(id: "main"); NSApp.activate(); app.chronicles.beginSetup() }
+        }
         Divider()
         Button("Import Chronicles export…") { openWindow(id: "main"); NSApp.activate(); NotificationCenter.default.post(name: .smithImport, object: nil) }
         if app.sync.isPaired { Button("Sync with iPad") { Task { await app.sync.syncNow() } } }

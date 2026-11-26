@@ -50,8 +50,9 @@ final class ChroniclesConnection {
     }
 
     var isUnlocked: Bool { state == .unlocked }
-    /// Smith is set up for Chronicles and currently locked: Chronicles features wait for an unlock.
-    var isLocked: Bool { state != .notSetUp && state != .unlocked }
+    /// Smith only works connected to Chronicles: until it's signed in and unlocked,
+    /// only the connect / unlock screen shows.
+    var isLocked: Bool { state != .unlocked }
 
     private func makeClient() throws -> ChroniclesClient {
         guard let url = URL(string: store.settings.chroniclesServer ?? Self.defaultServer), url.scheme == "https" || url.host == "localhost" || url.host == "127.0.0.1" else {
@@ -127,15 +128,17 @@ final class ChroniclesConnection {
         if state != .notSetUp { state = .locked }
     }
 
+    /// Ends the Chronicles session completely (even with Face ID unlock on) and
+    /// goes back to the password screen. The account email is remembered.
+    func signOut() {
+        Self.forgetQuickUnlock()
+        lock()
+    }
+
     /// Show the sign-in screen to connect for the first time.
     func beginSetup() {
         lastError = nil
         state = .locked
-    }
-
-    /// Back out of a first-time connect.
-    func cancelSetup() {
-        if store.settings.chroniclesEmail == nil { state = .notSetUp }
     }
 
     /// Forget the account on this device (back to Export All imports).
@@ -146,6 +149,21 @@ final class ChroniclesConnection {
         store.updateLocalSettings { $0.chroniclesEmail = nil }
         state = .notSetUp
     }
+
+    /// A fresh start with Chronicles: signs out, forgets the account on this
+    /// device and deletes the Chronicles data Smith kept. Memory and letters stay.
+    func removeChroniclesData() {
+        disconnect()
+        store.clearChroniclesData()
+        hiddenTopicIDs = []
+        lastSync = nil
+        lastError = nil
+    }
+
+    #if DEBUG
+    /// Screenshots only: shows the app as if signed in (no session, nothing syncs).
+    func debugShowAsUnlocked() { state = .unlocked }
+    #endif
 
     func noteActivity() { lastActivity = Date() }
 
@@ -240,6 +258,23 @@ final class ChroniclesConnection {
 
     /// Pulls what changed. Journal entries are summarized on the device as they
     /// arrive and their text dropped (the same path as Export All).
+    // MARK: AI standing (shared with Chronicles: consent, the refusal ladder, the anonymized id)
+
+    func aiStatus() async throws -> AIChatStatus {
+        guard let s = session, let c = client else { throw ChroniclesError.locked }
+        return try await c.aiStatus(s)
+    }
+
+    func confirmAIConsent() async throws -> AIChatStatus {
+        guard let s = session, let c = client else { throw ChroniclesError.locked }
+        return try await c.confirmAIConsent(s)
+    }
+
+    func reportAIRefusal() async throws -> AIChatStatus {
+        guard let s = session, let c = client else { throw ChroniclesError.locked }
+        return try await c.reportAIRefusal(s)
+    }
+
     func refresh() async {
         guard let sync, !syncing else { return }
         syncing = true

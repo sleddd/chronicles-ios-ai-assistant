@@ -27,6 +27,10 @@ public struct ClaudeRequest: Sendable {
     public var tools: [JSONValue]
     /// A JSON schema the reply must follow (structured outputs).
     public var jsonSchema: JSONValue?
+    /// Sent as `metadata.user_id`: an anonymized id, never a name or email.
+    public var userID: String?
+    /// Safety screening requests are left off the refusal ladder.
+    public var countsRefusals = true
 
     public init(model: ClaudeModel, maxTokens: Int = 16000, effort: String = "low",
                 system: [SystemBlock], messages: [JSONValue], tools: [JSONValue] = [], jsonSchema: JSONValue? = nil) {
@@ -53,6 +57,7 @@ public struct ClaudeRequest: Sendable {
             "fallbacks": "default",
         ]
         if !tools.isEmpty { o["tools"] = .array(tools) }
+        if let userID, !userID.isEmpty { o["metadata"] = ["user_id": .string(userID)] }
         return .object(o)
     }
 }
@@ -76,6 +81,8 @@ public enum ClaudeError: LocalizedError, Equatable {
     case api(String)
     case refused
     case malformed
+    /// AI is paused or turned off for this person (see AIGuard).
+    case unavailable(String)
 
     public var errorDescription: String? {
         switch self {
@@ -84,6 +91,7 @@ public enum ClaudeError: LocalizedError, Equatable {
         case .api(let m): return m
         case .refused: return "Claude declined that request."
         case .malformed: return "Claude sent a reply I couldn't read."
+        case .unavailable(let m): return m
         }
     }
 }
@@ -91,16 +99,20 @@ public enum ClaudeError: LocalizedError, Equatable {
 public struct URLSessionTransport: ClaudeTransport {
     let apiKey: @Sendable () -> String?
     let session: URLSession
+    let guardrail: AIGuard
 
-    public init(session: URLSession = .shared, apiKey: @escaping @Sendable () -> String?) {
-        self.session = session; self.apiKey = apiKey
+    public init(session: URLSession = .shared, guard guardrail: AIGuard = .shared, apiKey: @escaping @Sendable () -> String?) {
+        self.session = session; self.apiKey = apiKey; self.guardrail = guardrail
     }
 
     public func stream(_ request: ClaudeRequest) -> AsyncThrowingStream<SSEEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    if let reason = guardrail.unavailable { throw ClaudeError.unavailable(reason) }
                     guard let key = apiKey(), !key.isEmpty else { throw ClaudeError.missingKey }
+                    var request = request
+                    if request.userID == nil { request.userID = guardrail.userID }
                     var req = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
                     req.httpMethod = "POST"
                     req.timeoutInterval = 600
@@ -125,6 +137,11 @@ public struct URLSessionTransport: ClaudeTransport {
                         } else if line.hasPrefix("data:") {
                             data += line.dropFirst(5).trimmingCharacters(in: .whitespaces)
                             // The API sends one data line per event; yield right away.
+                            // A safety refusal (after any fallback) is reported once for the ladder
+                            if request.countsRefusals, event == "message_delta", data.contains("\"refusal\""),
+                               (try? JSONValue.parse(Data(data.utf8)))?["delta"]?["stop_reason"]?.string == "refusal" {
+                                guardrail.reportRefusal()
+                            }
                             continuation.yield(SSEEvent(event: event, data: data))
                             event = "message"; data = ""
                         }

@@ -39,6 +39,7 @@ public struct SmithContext: Sendable {
     public func systemBlocks(spoken: Bool) -> [SystemBlock] {
         var persona = PersonaPrompt.system(name: name, spoken: spoken)
         if canAct { persona += "\n\n" + ChroniclesActionTools.persona }
+        persona += "\n\n" + ChatSafety.baseline
         var blocks = [SystemBlock(persona)]
 
         var memory: [String] = []
