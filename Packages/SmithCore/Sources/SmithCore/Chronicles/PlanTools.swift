@@ -202,7 +202,7 @@ public struct TaskBlockersTool: LocalTool {
 
         // Worked out from what Smith holds, then applied to a fresh read
         var adding: TaskBlocker?
-        var removeID: String?
+        var removing: TaskBlocker?
         var what: String
         switch action {
         case "add":
@@ -222,7 +222,7 @@ public struct TaskBlockersTool: LocalTool {
                 if task.blockers.isEmpty { return "\"\(task.title)\" has no blockers." }
                 return candidates.isEmpty ? "Its blockers: \(task.blockers.map(title).joined(separator: "; ")). Which one?" : "Which one? \(candidates.joined(separator: ", "))."
             }
-            removeID = b.id; what = "take \"\(title(b))\" off what's blocking \"\(task.title)\""
+            removing = b; what = "take \"\(title(b))\" off what's blocking \"\(task.title)\""
         case "clear":
             if task.blockers.isEmpty { return "\"\(task.title)\" has no blockers." }
             what = "clear everything blocking \"\(task.title)\""
@@ -230,6 +230,7 @@ public struct TaskBlockersTool: LocalTool {
         }
         guard input["explicit"]?.bool == true else { return askFirst(what) }
         guard let writer = await ctx.writer() else { return "Smith is locked; unlock first." }
+        var removed = true
         let before = try await writer.updateEntry(id: id) { _, meta in
             var cf = meta["_customFields"]?.object ?? [:]
             var list = TaskBlocker.list(from: cf["blockers"])
@@ -239,12 +240,17 @@ public struct TaskBlockersTool: LocalTool {
                    !list.contains(where: { ($0.taskID != nil && $0.taskID == a.taskID) || ($0.note != nil && $0.note?.lowercased() == a.note?.lowercased()) }) {
                     list.append(a)
                 }
-            case "remove": list.removeAll { $0.id == removeID }
+            case "remove":
+                let count = list.count
+                if let b = removing { list.removeAll { $0.same(b) } }
+                removed = list.count < count
             default: list = []
             }
             cf["blockers"] = .array(list.map(\.json))
             meta["_customFields"] = .object(cf)
         }
+        // Gone from Chronicles since Smith last looked: say so rather than claim it
+        if action == "remove", !removed { return "That blocker wasn't on \"\(task.title)\" any more; nothing was changed." }
         let summary: String
         switch action {
         case "add": summary = "\"\(task.title)\" is now blocked by \(adding.map(title).map { "\"\($0)\"" } ?? "that")."
@@ -276,16 +282,19 @@ public struct EditPrioritiesTool: LocalTool {
     }
 
     /// The list after the change, and what it did in words (nil list = a problem, in the words).
+    /// The item meant by `item` (its number, or words from it), or what's wrong, in words.
+    static func resolve(_ item: String?, in list: [PriorityList.Item]) -> (Int?, String) {
+        let q = item?.trimmingCharacters(in: .whitespaces) ?? ""
+        if let n = Int(q) { return (1...max(1, list.count)).contains(n) && n <= list.count ? (n - 1, "") : (nil, "There's no number \(n) on the list.") }
+        let (m, candidates) = bestMatch(Array(list.enumerated()), name: { $0.element.text }, query: q)
+        if let m { return (m.offset, "") }
+        if list.isEmpty { return (nil, "The priorities list is empty.") }
+        return (nil, candidates.isEmpty ? "Nothing on the list matches \"\(q)\". The list: \(list.map(\.text).joined(separator: "; "))." : "Which one? \(candidates.joined(separator: ", ")).")
+    }
+
     static func apply(_ action: String, to items: [PriorityList.Item], item: String?, text: String?, position: Int?) -> ([PriorityList.Item]?, String) {
         var list = items
-        func index() -> (Int?, String) {
-            let q = item?.trimmingCharacters(in: .whitespaces) ?? ""
-            if let n = Int(q) { return (1...max(1, list.count)).contains(n) && n <= list.count ? (n - 1, "") : (nil, "There's no number \(n) on the list.") }
-            let (m, candidates) = bestMatch(Array(list.enumerated()), name: { $0.element.text }, query: q)
-            if let m { return (m.offset, "") }
-            if list.isEmpty { return (nil, "The priorities list is empty.") }
-            return (nil, candidates.isEmpty ? "Nothing on the list matches \"\(q)\". The list: \(list.map(\.text).joined(separator: "; "))." : "Which one? \(candidates.joined(separator: ", ")).")
-        }
+        func index() -> (Int?, String) { resolve(item, in: list) }
         let words = text.map { $0.split(whereSeparator: \.isNewline).joined(separator: " ").trimmingCharacters(in: .whitespaces) } ?? ""
         switch action {
         case "add":
@@ -331,6 +340,10 @@ public struct EditPrioritiesTool: LocalTool {
             return askFirst(ask)
         }
         guard let writer = await ctx.writer() else { return "Smith is locked; unlock first." }
+        // The item they confirmed, as Smith holds it: found again in the fresh read by its
+        // id, so a list reordered in Chronicles since can't turn "number 2" into another item
+        let target: PriorityList.Item? = action == "add" ? nil
+            : Self.resolve(item, in: snap.priorities?.items ?? []).0.map { (snap.priorities?.items ?? [])[$0] }
 
         guard let entry = snap.priorities?.entryID.flatMap(Int.init) else {
             // No list yet: a new Priorities entry, as Chronicles' dashboard makes one
@@ -350,7 +363,14 @@ public struct EditPrioritiesTool: LocalTool {
                 guard let t = i["text"]?.string, !t.isEmpty else { return nil }
                 return .init(text: t, done: i["done"]?.bool ?? false, id: i["id"]?.string)
             }
-            let (list, words) = Self.apply(action, to: fresh, item: item, text: text, position: position)
+            var which = item
+            if let target {
+                guard let i = fresh.firstIndex(where: { $0.same(target) }) else {
+                    failed = true; result = "\"\(target.text)\" isn't on the priorities list any more; nothing was changed."; return
+                }
+                which = String(i + 1)
+            }
+            let (list, words) = Self.apply(action, to: fresh, item: which, text: text, position: position)
             guard let list else { failed = true; result = words; return }
             result = words
             cf["priorities"] = ChroniclesShapes.priorities(list)

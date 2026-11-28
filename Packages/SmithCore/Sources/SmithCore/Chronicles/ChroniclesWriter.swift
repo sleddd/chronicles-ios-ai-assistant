@@ -57,9 +57,15 @@ public struct ChroniclesWriter: Sendable {
     }
 
     /// Fresh read, change, save. Returns the entry as it was (for undo).
-    public func updateEntry(id: Int, change: (inout String, inout [String: JSONValue]) throws -> Void) async throws -> (content: String, metadata: JSONValue) {
+    /// One entry read fresh and opened.
+    public func readEntry(id: Int) async throws -> (content: String, metadata: JSONValue) {
         let row = try await client.call("GET", "/api/entries/\(id)", nil, session).body
         guard let current = client.decryptEntry(row, session) else { throw ChroniclesError.notFound("That entry couldn’t be opened.") }
+        return (current.content, current.metadata)
+    }
+
+    public func updateEntry(id: Int, change: (inout String, inout [String: JSONValue]) throws -> Void) async throws -> (content: String, metadata: JSONValue) {
+        let current = try await readEntry(id: id)
         var content = current.content
         var meta = current.metadata.object ?? [:]
         try change(&content, &meta)
@@ -150,8 +156,11 @@ public struct ChroniclesWriter: Sendable {
         _ = try await updateEntry(id: id) { _, meta in ChroniclesShapes.setTaskStatus(&meta, to: status) }
     }
 
-    /// The priorities list read fresh, changed, saved. `change` returns nil to leave it as it is.
-    public func updatePriorities(entryID: Int, _ change: @Sendable ([PriorityList.Item]) -> [PriorityList.Item]?) async throws {
+    /// The priorities list read fresh, changed, saved. `change` returns nil to leave it as it is
+    /// (then false: nothing was changed).
+    @discardableResult
+    public func updatePriorities(entryID: Int, _ change: @Sendable ([PriorityList.Item]) -> [PriorityList.Item]?) async throws -> Bool {
+        var changed = false
         _ = try await updateEntry(id: entryID) { _, meta in
             var cf = meta["_customFields"]?.object ?? [:]
             let items = (cf["priorities"]?.array ?? []).compactMap { i -> PriorityList.Item? in
@@ -161,12 +170,16 @@ public struct ChroniclesWriter: Sendable {
             guard let list = change(items) else { return }
             cf["priorities"] = ChroniclesShapes.priorities(list)
             meta["_customFields"] = .object(cf)
+            changed = true
         }
+        return changed
     }
 
     /// The Wins list read fresh, changed, saved: its items and, as Chronicles keeps
     /// it, its text ("Wins: 11/25/2026" over the wins as a list).
-    public func updateWins(entryID: Int, _ change: @Sendable ([WinsList.Item]) -> [WinsList.Item]?) async throws {
+    @discardableResult
+    public func updateWins(entryID: Int, _ change: @Sendable ([WinsList.Item]) -> [WinsList.Item]?) async throws -> Bool {
+        var changed = false
         _ = try await updateEntry(id: entryID) { content, meta in
             var cf = meta["_customFields"]?.object ?? [:]
             let items = (cf["wins"]?.array ?? []).compactMap { i -> WinsList.Item? in
@@ -178,11 +191,15 @@ public struct ChroniclesWriter: Sendable {
             meta["_customFields"] = .object(cf)
             let title = content.range(of: #"Wins: \d{2}/\d{2}/\d{4}"#, options: .regularExpression).map { String(content[$0]) } ?? "Wins"
             content = ChroniclesShapes.winsContent(title: title, list)
+            changed = true
         }
+        return changed
     }
 
     /// The shopping list read fresh, changed, saved (its notes and recipes stay as they are).
-    public func updateShopping(entryID: Int, _ change: @Sendable ([ShoppingList.Item]) -> [ShoppingList.Item]?) async throws {
+    @discardableResult
+    public func updateShopping(entryID: Int, _ change: @Sendable ([ShoppingList.Item]) -> [ShoppingList.Item]?) async throws -> Bool {
+        var changed = false
         _ = try await updateEntry(id: entryID) { _, meta in
             var cf = meta["_customFields"]?.object ?? [:]
             let raw = cf["items"]?.array ?? []
@@ -193,7 +210,9 @@ public struct ChroniclesWriter: Sendable {
             guard let list = change(items) else { return }
             cf["items"] = .array(list.map { ["id": .string($0.id), "name": .string($0.name), "category": .string($0.category), "checked": .bool($0.checked)] })
             meta["_customFields"] = .object(cf)
+            changed = true
         }
+        return changed
     }
 
     /// A routine session ticked done: an Exercise entry for that slot, as Chronicles

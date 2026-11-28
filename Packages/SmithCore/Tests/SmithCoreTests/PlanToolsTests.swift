@@ -177,6 +177,22 @@ import Testing
         #expect(fields(server, 12)["blockers"]?.array?.isEmpty == true)
     }
 
+    @Test func aBlockerSavedWithoutAnIdCanStillBeRemoved() async throws {
+        let server = try planServer()
+        // No ids: every read makes new ones, so Smith's copy and the fresh read differ
+        try server.put(entry: 12, content: "<p>Book flights</p>", metadata: ["_taxonomyId": 1, "_customFields": [
+            "taskDescription": "Book flights", "isCompleted": false, "priority": "medium",
+            "blockers": [["taskId": 11], ["note": "waiting on Dana"]]]])
+        let s = try await setup(server)
+        let tool = s.tool("task_blockers")
+        #expect(try await tool.run(["task": "flights", "action": "remove", "which": "Dana", "explicit": true]) == "Took that blocker off \"Book flights\".")
+        let left = fields(server, 12)["blockers"]?.array ?? []
+        #expect(left.count == 1 && left[0]["taskId"]?.int == 11)
+        // Gone in Chronicles since Smith looked: said so, not claimed
+        #expect(try await tool.run(["task": "flights", "action": "remove", "which": "Dana", "explicit": true])
+                == "That blocker wasn't on \"Book flights\" any more; nothing was changed.")
+    }
+
     @Test func deleteKeepsACopyAndUndoPutsItBack() async throws {
         let server = try planServer()
         let writes = Collector()
@@ -234,6 +250,63 @@ import Testing
         #expect(list.map { $0["id"]?.string } == ["p1", "p2"] && list[1]["done"]?.bool == true)
         #expect(try await s.tool("edit_priorities").run(["action": "add", "text": "Pay rent", "explicit": false]).contains("add \"Pay rent\""))
         #expect(try await s.tool("edit_priorities").run(["action": "done", "item": "deck", "explicit": false]).contains("like you to tick off \"Ship the deck\""))
+    }
+
+    @Test func aPriorityIsFoundByIdWhenTheListWasReordered() async throws {
+        let server = try planServer()
+        let s = try await setup(server)
+        // Reordered in Chronicles after Smith looked: number 2 was "Call Mum" and still means it
+        try server.put(entry: 70, content: "<p>Priorities: 11/25/2026</p>", metadata: ["_taxonomyId": 9, "_customFields": [
+            "priorities": [["id": "p2", "text": "Call Mum", "done": false], ["id": "p1", "text": "Ship the deck", "done": false]]]])
+        #expect(try await s.tool("edit_priorities").run(["action": "done", "item": "2", "explicit": true]) == "Ticked off \"Call Mum\".")
+        let list = fields(server, 70)["priorities"]?.array ?? []
+        #expect(list[0]["id"]?.string == "p2" && list[0]["done"]?.bool == true && list[1]["done"]?.bool == false)
+        // Removed in Chronicles since: nothing changes
+        try server.put(entry: 70, content: "<p>Priorities: 11/25/2026</p>", metadata: ["_taxonomyId": 9, "_customFields": [
+            "priorities": [["id": "p1", "text": "Ship the deck", "done": false]]]])
+        #expect(try await s.tool("edit_priorities").run(["action": "remove", "item": "mum", "explicit": true])
+                == "\"Call Mum\" isn't on the priorities list any more; nothing was changed.")
+        #expect(fields(server, 70)["priorities"]?.array?.count == 1)
+        // The Today page's tick: by id too, and false when the item is gone
+        let mum = PriorityList.Item(text: "Call Mum", done: false, id: "p2")
+        #expect(try await s.writer.updatePriorities(entryID: 70) { items in
+            guard let i = items.firstIndex(where: { $0.same(mum) }) else { return nil }
+            var l = items; l[i].done = true; return l
+        } == false)
+    }
+
+    @Test func theTodayDoseTickGoesByMedicationID() async throws {
+        let server = try planServer()
+        // A second medication whose name would make "vitamin d" ask "which one?"
+        try server.put(entry: 41, content: "<p>Vitamin D3</p>", metadata: ["_taxonomyId": 4, "_customFields": [
+            "medicationName": "Vitamin D3", "dosage": "", "frequency": "once_daily", "scheduleTimes": ["20:00"], "isActive": true]])
+        let writes = Collector()
+        let s = try await setup(server, writes: writes)
+        let tool = try #require(s.tool("log_dose") as? LogDoseTool)
+        try await tool.markTaken(medicationID: "41", time: "20:00")
+        #expect(writes.items == ["Marked Vitamin D3 (20:00) taken."])
+        let rec = try #require(server.doses.values.compactMap { server.openDose($0["id"]!.string!) }.first)
+        #expect(rec["medicationPostId"]?.int == 41 && rec["scheduledTime"]?.string == "20:00" && rec["status"]?.string == "taken")
+        // A time that isn't on its schedule, or a medication that isn't there, is an error, not a quiet nothing
+        await #expect(throws: ChroniclesError.self) { try await tool.markTaken(medicationID: "41", time: "09:00") }
+        await #expect(throws: ChroniclesError.self) { try await tool.markTaken(medicationID: "999", time: "08:00") }
+    }
+
+    @Test func undoChangeUndoesSmithsRecentChanges() async throws {
+        let undone = Collector()
+        var ctx = ChroniclesActionContext(writer: { nil }, snapshot: { nil }, topicID: { _ in nil }, hiddenTopicIDs: { [] },
+                                          estimateNutrients: { _, _, _ in nil }, didWrite: { _ in })
+        ctx.recentChanges = { ["Changed \"Dentist\": moved to Fri 27 Nov.", "Deleted the task \"Book flights\"."] }
+        ctx.undoChange = { i in undone.add(String(i)); return "Undid it." }
+        let tool = UndoChangeTool(ctx)
+        #expect(try await tool.run(["explicit": false]).contains("Dentist"))
+        #expect(undone.items.isEmpty)
+        #expect(try await tool.run(["explicit": true]) == "Undid it.")
+        #expect(try await tool.run(["change": "flights", "explicit": true]) == "Undid it.")
+        #expect(undone.items == ["0", "1"])
+
+        ctx.recentChanges = { [] }
+        #expect(try await UndoChangeTool(ctx).run(["explicit": true]).hasPrefix("Nothing you changed"))
     }
 
     @Test func aFirstPrioritiesListIsCreated() async throws {

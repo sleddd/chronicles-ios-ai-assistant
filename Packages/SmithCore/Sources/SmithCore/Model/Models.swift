@@ -55,6 +55,15 @@ public struct TaskBlocker: Codable, Equatable, Sendable, Identifiable {
         self.id = id; self.taskID = taskID; self.note = note
     }
 
+    /// The same blocker in a fresh read: by id, else by what it is. A blocker Chronicles
+    /// saved without an id gets a new one on every read, so the id alone can miss it.
+    public func same(_ other: TaskBlocker) -> Bool {
+        if id == other.id { return true }
+        if let t = taskID { return other.taskID == t }
+        if let n = note?.lowercased() { return other.note?.lowercased() == n }
+        return false
+    }
+
     public static let maxPerTask = 10
     public static let maxNote = 200
 
@@ -264,6 +273,14 @@ public struct PriorityList: Codable, Equatable, Sendable {
         /// Chronicles' id for the item (kept so a rewrite doesn't lose it).
         public var id: String? = nil
         public init(text: String, done: Bool, id: String? = nil) { self.text = text; self.done = done; self.id = id }
+        /// The same item in a fresh read of the list: by Chronicles' id, else (an item
+        /// saved without one) by its words.
+        public func same(_ other: Item) -> Bool {
+            if let id, let o = other.id { return id == o }
+            return text == other.text
+        }
+        /// Stable while the list changes around it (for the Today page's checkboxes).
+        public var key: String { id ?? "text:" + text }
     }
     public var day: String
     public var items: [Item]

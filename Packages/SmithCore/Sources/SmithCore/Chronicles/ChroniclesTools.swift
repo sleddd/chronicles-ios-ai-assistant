@@ -20,6 +20,10 @@ public struct ChroniclesActionContext: Sendable {
     public var noteWellnessEntry: @Sendable (String, Int) async -> Void = { _, _ in }
     /// Their tagged journal and topic entries Smith may see (empty while journal sharing is off).
     public var taggedEntries: @Sendable () async -> [TaggedEntry] = { [] }
+    /// What Smith changed in the last two minutes and can still undo, newest first.
+    public var recentChanges: @Sendable () async -> [String] = { [] }
+    /// Undoes one of `recentChanges` by its place in that list (0 = newest); says what happened.
+    public var undoChange: @Sendable (Int) async -> String = { _ in "Nothing to undo." }
     public var now: @Sendable () -> Date
     public var timeZone: TimeZone
 
@@ -149,6 +153,23 @@ public struct LogDoseTool: LocalTool {
 }
 
 extension LogDoseTool {
+    /// The Today page's tick: one scheduled dose, by the medication's id and the dose's
+    /// time, marked taken (with its Meals row, as the tool adds one). Throws when it can't.
+    public func markTaken(medicationID: String, time: String) async throws {
+        guard let snap = await ctx.snapshot(),
+              let med = snap.medications.first(where: { $0.id == medicationID && $0.isActive }) else {
+            throw ChroniclesError.notFound("That medication isn’t in Chronicles any more.")
+        }
+        guard let writer = await ctx.writer() else { throw ChroniclesError.locked }
+        let t = String(time.prefix(5))
+        guard let medID = Int(med.id), med.scheduleTimes.map({ String($0.prefix(5)) }).contains(t) else {
+            throw ChroniclesError.notFound("That dose isn’t on \(med.name)’s schedule any more.")
+        }
+        let undo = try await writer.logDose(medicationID: medID, scheduledTime: t, date: ctx.today, status: "taken", takenAt: nil)
+        let meal = await addToMeals(writer, medID: medID, time: t)
+        await ctx.didWrite(WriteResult(summary: "Marked \(med.name) (\(t)) taken.", undo: meal.map { .all([undo, $0]) } ?? undo))
+    }
+
     /// Chronicles' dashboard adds a "medication" Meals row for a dose with vitamins
     /// or minerals in it; Smith does the same. Returns its undo, or nil when nothing was added.
     func addToMeals(_ writer: ChroniclesWriter, medID: Int, time: String) async -> UndoAction? {
@@ -389,7 +410,7 @@ public enum ChroniclesActionTools {
     public static func all(_ ctx: ChroniclesActionContext) -> [LocalTool] {
         [LogMealTool(ctx), LogDoseTool(ctx), CheckHabitTool(ctx), SaveNoteTool(ctx), AddTaskTool(ctx), SetTaskStatusTool(ctx),
          EditTaskTool(ctx), TaskBlockersTool(ctx), DeleteTaskTool(ctx), EditPrioritiesTool(ctx), EditEventTool(ctx), TagEntryTool(ctx),
-         MarkBillPaidTool(ctx), UpdateWellnessTool(ctx)]
+         MarkBillPaidTool(ctx), UpdateWellnessTool(ctx), UndoChangeTool(ctx)]
     }
 
     /// Added to the persona when Smith is connected to Chronicles.
@@ -404,6 +425,40 @@ public enum ChroniclesActionTools {
         replies"), ask first in a natural way ("Want me to mark it blocked?"), and act only after they say yes. When a \
         name could mean more than one task or event, ask which. Delete only tasks, and only when they ask; Chronicles \
         keeps a copy for two weeks. You can't delete anything else, or change anything not listed here; if they ask, \
-        say you can't and that they can do it in Chronicles.
+        say you can't and that they can do it in Chronicles. When they ask you to undo or put back something you \
+        changed in the last two minutes, use undo_change.
         """
+}
+
+/// Undoes one of Smith's own changes from the last two minutes, the same as tapping its Undo pill
+/// (which a new answer clears from the screen, while the change can still be undone).
+public struct UndoChangeTool: LocalTool {
+    let ctx: ChroniclesActionContext
+    public init(_ ctx: ChroniclesActionContext) { self.ctx = ctx }
+    public var changesData: Bool { true }
+    public var name: String { "undo_change" }
+    public var description: String {
+        "Undo a change you made in Chronicles in the last two minutes. With no words, the most recent one; with words, the newest change they match."
+    }
+    public var inputSchema: JSONValue {
+        ["type": "object", "properties": [
+            "change": ["type": "string", "description": "Words from the change to undo, if it isn't the most recent one. Optional."],
+            "explicit": explicitProperty,
+        ], "required": ["explicit"], "additionalProperties": false]
+    }
+    public func run(_ input: JSONValue) async throws -> String {
+        let recent = await ctx.recentChanges()
+        guard !recent.isEmpty else { return "Nothing you changed in the last two minutes; older changes are made in Chronicles." }
+        var index = 0
+        if let q = input["change"]?.string, !q.trimmingCharacters(in: .whitespaces).isEmpty {
+            let (match, candidates) = bestMatch(Array(recent.enumerated()), name: { $0.element }, query: q)
+            guard let match else {
+                return candidates.isEmpty ? "No recent change matches \"\(q)\". Recent changes: \(recent.joined(separator: " | "))"
+                                          : "Which one? \(candidates.joined(separator: " | "))"
+            }
+            index = match.offset
+        }
+        guard input["explicit"]?.bool == true else { return askFirst("undo this: \(recent[index])") }
+        return await ctx.undoChange(index)
+    }
 }

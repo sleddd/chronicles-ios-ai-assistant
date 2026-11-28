@@ -31,6 +31,9 @@ final class ChroniclesConnection {
     private(set) var syncing = false
     private(set) var hiddenTopicIDs: Set<Int> = []
     private(set) var undoables: [Undoable] = []
+    /// Smith's changes from the last two minutes, newest last, whether or not their pill
+    /// is still showing: "undo that" in the chat still works after a new answer clears the pills.
+    @ObservationIgnored private var recentChanges: [Undoable] = []
     /// Chronicles is moving the journal to a new key; sync waits and tries again.
     private(set) var rekeying = false
 
@@ -154,7 +157,7 @@ final class ChroniclesConnection {
         onLock?()
         cloud.signedOut()
         store.closeVault()
-        undoables = []
+        undoables = []; recentChanges = []
         APIKeys.setChroniclesKey(nil)
         if state != .notSetUp { state = .locked }
     }
@@ -423,7 +426,9 @@ final class ChroniclesConnection {
                 await MainActor.run {
                     guard let self else { return }
                     if chips, let undo = result.undo {
-                        self.undoables.append(Undoable(summary: result.summary, action: undo, expires: Date().addingTimeInterval(115)))
+                        let item = Undoable(summary: result.summary, action: undo, expires: Date().addingTimeInterval(115))
+                        self.undoables.append(item)
+                        self.recentChanges.append(item)
                     }
                     Task { await self.refresh() }
                 }
@@ -436,6 +441,12 @@ final class ChroniclesConnection {
         }
         ctx.noteWellnessEntry = { [weak self] day, id in await MainActor.run { self?.newWellness[day] = id } }
         ctx.taggedEntries = { await MainActor.run { store.taggedEntries } }
+        ctx.recentChanges = { [weak self] in
+            await MainActor.run { self?.liveRecentChanges().reversed().map(\.summary) ?? [] }
+        }
+        ctx.undoChange = { [weak self] index in
+            await self?.undoRecent(index) ?? "Smith is locked; unlock first."
+        }
         return ctx
     }
 
@@ -447,11 +458,12 @@ final class ChroniclesConnection {
         return await save { try await writer.setTaskStatus(id: n, status: done ? "done" : "todo") }
     }
 
-    /// Ticks a priority off or back on, by its place in the list.
-    func setPriority(at index: Int, done: Bool) async -> Bool {
+    /// Ticks a priority off or back on: found in the fresh read by its id (else its
+    /// words), so a list reordered in Chronicles since can't tick a different one.
+    func setPriority(_ item: PriorityList.Item, done: Bool) async -> Bool {
         await changePriorities { items in
-            guard items.indices.contains(index) else { return nil }
-            var list = items; list[index].done = done; return list
+            guard let i = items.firstIndex(where: { $0.same(item) }) else { return nil }
+            var list = items; list[i].done = done; return list
         }
     }
 
@@ -474,15 +486,14 @@ final class ChroniclesConnection {
     }
 
     /// A scheduled dose ticked taken (with its Meals row, as Chronicles adds one), or back to not taken.
-    func setDose(medication: String, medicationID: String, time: String, taken: Bool) async -> Bool {
+    func setDose(medicationID: String, time: String, taken: Bool) async -> Bool {
         guard let writer = liveWriter, let medID = Int(medicationID) else { return false }
         let today = Day.key()
         if taken {
-            // Smith's own dose tool, so a tick here does exactly what "Smith, I took it" does
+            // What "Smith, I took it" does, but by the medication's id: a name could match
+            // another medication, or need a "which one?"
             let tool = LogDoseTool(actionContext(estimate: { _, _, _ in nil }, chips: false))
-            return await save {
-                _ = try await tool.run(["medication": .string(medication), "status": "taken", "time": .string(time), "explicit": true])
-            }
+            return await save { try await tool.markTaken(medicationID: medicationID, time: time) }
         }
         let link = MedNutrients.linkKey(medicationID: medID, date: today, time: time)
         let meal = await sync?.doseLinkEntryID(link)
@@ -507,7 +518,22 @@ final class ChroniclesConnection {
         guard let writer = liveWriter else { return false }
         if !done {
             guard let id = slot.sessionID.flatMap(Int.init) else { return true }
-            return await save { _ = try await writer.deleteEntry(id: id) }
+            return await save {
+                // Only a bare session for this slot goes: one they've written notes or
+                // details on (perhaps logged in Chronicles itself) stays
+                let e = try await writer.readEntry(id: id)
+                guard e.metadata["_aiHidden"]?.bool != true, e.metadata["_routineLink"]?.string == slot.key else {
+                    throw ChroniclesError.notFound("That session can’t be removed from here. You can remove it in Chronicles.")
+                }
+                let cf = e.metadata["_customFields"]
+                let theirs = ["notes", "distance", "calories"].contains {
+                    !(cf?[$0]?.string ?? cf?[$0]?.double.map { String($0) } ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }
+                guard !theirs else {
+                    throw ChroniclesError.notFound("That session has your notes on it, so Smith left it. You can remove it in Chronicles.")
+                }
+                _ = try await writer.deleteEntry(id: id)
+            }
         }
         guard let topic = await sync?.topicID(named: ["Exercise"]) else {
             lastError = "There's no Exercise topic in Chronicles yet."; return false
@@ -539,10 +565,11 @@ final class ChroniclesConnection {
     func setShoppingItem(_ id: String, onList listID: String, got: Bool) async -> Bool {
         guard let writer = liveWriter, let entry = Int(listID) else { return false }
         return await save {
-            try await writer.updateShopping(entryID: entry) { items in
+            let changed = try await writer.updateShopping(entryID: entry) { items in
                 guard let i = items.firstIndex(where: { $0.id == id }) else { return nil }
                 var list = items; list[i].checked = got; return list
             }
+            if !changed { throw ChroniclesError.notFound("That item isn’t on the list any more.") }
         }
     }
 
@@ -556,7 +583,11 @@ final class ChroniclesConnection {
 
     private func changePriorities(_ change: @escaping @Sendable ([PriorityList.Item]) -> [PriorityList.Item]?) async -> Bool {
         guard let writer = liveWriter, let entry = store.snapshot?.priorities?.entryID.flatMap(Int.init) else { return false }
-        return await save { try await writer.updatePriorities(entryID: entry, change) }
+        return await save {
+            if !(try await writer.updatePriorities(entryID: entry, change)) {
+                throw ChroniclesError.notFound("That priority isn’t on the list any more.")
+            }
+        }
     }
 
     /// Saves, then brings Smith's picture of the day up to date.
@@ -574,19 +605,45 @@ final class ChroniclesConnection {
     }
 
     func undo(_ item: Undoable) async {
+        if let problem = await perform(item) { lastError = problem.shown }
+    }
+
+    /// Undoes one change; nil when it worked, else what went wrong: in words for the
+    /// screen, and for the model without the server's own text (ChroniclesError.forModel).
+    private func perform(_ item: Undoable) async -> (shown: String, forModel: String)? {
         undoables.removeAll { $0.id == item.id }
+        recentChanges.removeAll { $0.id == item.id }
         guard let session, let client, item.expires > Date() else {
-            lastError = "That can’t be undone any more. You can change it in Chronicles."
-            return
+            let m = "That can’t be undone any more. You can change it in Chronicles."
+            return (m, m)
         }
         do {
             try await ChroniclesWriter(client: client, session: session).undo(item.action)
             await refresh()
+            return nil
         } catch ChroniclesError.keyChanged {
-            Self.forgetQuickUnlock(); lock(); lastError = ChroniclesError.keyChanged.errorDescription
+            Self.forgetQuickUnlock(); lock()
+            return (ChroniclesError.keyChanged.errorDescription ?? "", ChroniclesError.keyChanged.forModel)
+        } catch let e as ChroniclesError {
+            return ("Undo didn’t work: \(e.localizedDescription)", "Undo didn't work: \(e.forModel)")
         } catch {
-            lastError = "Undo didn’t work: \(error.localizedDescription)"
+            return ("Undo didn’t work: \(error.localizedDescription)", "Undo didn't work; it can be changed in Chronicles.")
         }
+    }
+
+    private func liveRecentChanges(now: Date = Date()) -> [Undoable] {
+        recentChanges.removeAll { $0.expires <= now }
+        return recentChanges
+    }
+
+    /// Smith's undo_change: `index` counts back from the newest change (0 = the last one).
+    private func undoRecent(_ index: Int) async -> String {
+        let live = liveRecentChanges()
+        guard !live.isEmpty else { return "Nothing Smith changed in the last two minutes; older changes are made in Chronicles." }
+        guard live.indices.contains(live.count - 1 - index) else { return "There's no such change to undo." }
+        let item = live[live.count - 1 - index]
+        if let problem = await perform(item) { return problem.forModel }
+        return "Undid: \(item.summary)"
     }
 
     /// A new answer has started: the last one's Undo pills leave the screen.

@@ -7,7 +7,7 @@ struct TodaySheet: View {
     @Environment(AppModel.self) private var app
     /// Ticked here and not yet back from Chronicles: shown at once, put back if the save fails.
     @State private var taskTicks: [String: Bool] = [:]
-    @State private var priorityTicks: [Int: Bool] = [:]
+    @State private var priorityTicks: [String: Bool] = [:]
     @State private var newPriority = ""
     @State private var shoppingTicks: [String: Bool] = [:]
     @State private var doseTicks: [String: Bool] = [:]
@@ -96,11 +96,11 @@ struct TodaySheet: View {
                 if !o.priorityItems.isEmpty || canTick {
                     SectionLabel("Priorities")
                     GlassCard {
-                        ForEach(Array(o.priorityItems.enumerated()), id: \.offset) { i, p in
-                            let done = priorityTicks[i] ?? p.done
+                        ForEach(o.priorityItems, id: \.key) { p in
+                            let done = priorityTicks[p.key] ?? p.done
                             HStack(alignment: .firstTextBaseline, spacing: 10) {
                                 if canTick {
-                                    checkbox(done) { tickPriority(i, !done) }
+                                    checkbox(done) { tickPriority(p, !done) }
                                 } else {
                                     Text("·").foregroundStyle(Theme.dim)
                                 }
@@ -247,7 +247,7 @@ struct TodaySheet: View {
     private func tickDose(_ d: DayOverview.Dose, key: String, _ taken: Bool) {
         doseTicks[key] = taken
         Task {
-            if !(await app.chronicles.setDose(medication: d.medication, medicationID: d.medicationID, time: d.time, taken: taken)) { doseTicks[key] = nil }
+            if !(await app.chronicles.setDose(medicationID: d.medicationID, time: d.time, taken: taken)) { doseTicks[key] = nil }
         }
     }
 
@@ -268,9 +268,9 @@ struct TodaySheet: View {
         Task { if !(await app.chronicles.setShoppingItem(id, onList: listID, got: got)) { shoppingTicks[id] = nil } }
     }
 
-    private func tickPriority(_ index: Int, _ done: Bool) {
-        priorityTicks[index] = done
-        Task { if !(await app.chronicles.setPriority(at: index, done: done)) { priorityTicks[index] = nil } }
+    private func tickPriority(_ item: PriorityList.Item, _ done: Bool) {
+        priorityTicks[item.key] = done
+        Task { if !(await app.chronicles.setPriority(item, done: done)) { priorityTicks[item.key] = nil } }
     }
 
     private func addPriority() {
