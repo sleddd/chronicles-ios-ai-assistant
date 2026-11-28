@@ -108,16 +108,18 @@ struct UndoChips: View {
     @Environment(AppModel.self) private var app
     var body: some View {
         TimelineView(.periodic(from: .now, by: 5)) { tl in
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 10) {
                 ForEach(app.chronicles.undoables.filter { $0.expires > tl.date }) { item in
-                    HStack(spacing: 10) {
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
                         Image(systemName: "checkmark.circle").foregroundStyle(Theme.teal)
-                        Text(item.summary).font(Theme.rounded(13, .regular)).foregroundStyle(Theme.soft).lineLimit(2)
+                        Text(item.summary).font(Theme.rounded(13, .regular)).foregroundStyle(Theme.soft)
+                            .lineSpacing(5).fixedSize(horizontal: false, vertical: true)
                         Button("Undo") { Task { await app.chronicles.undo(item) } }
                             .buttonStyle(.plain).font(Theme.rounded(12, .medium)).foregroundStyle(Theme.violet)
                     }
-                    .padding(.horizontal, 14).padding(.vertical, 8)
-                    .background(Color.black.opacity(0.6), in: Capsule())
+                    .padding(.horizontal, 16).padding(.vertical, 11)
+                    .background(ChatPill.fill, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(ChatPill.edge))
                 }
             }
             .onChange(of: tl.date) { _, now in app.chronicles.dropExpiredUndos(now: now) }

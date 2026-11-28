@@ -406,7 +406,8 @@ final class ChroniclesConnection {
 
     // MARK: actions
 
-    func actionContext(estimate: @escaping @Sendable (String, String?, String?) async -> [String: Double]?) -> ChroniclesActionContext {
+    /// `chips`: show an Undo pill in the chat for each change (not for the Today page's checkboxes).
+    func actionContext(estimate: @escaping @Sendable (String, String?, String?) async -> [String: Double]?, chips: Bool = true) -> ChroniclesActionContext {
         let session = self.session, client = self.client, sync = self.sync
         let store = self.store
         let hidden = hiddenTopicIDs
@@ -421,7 +422,7 @@ final class ChroniclesConnection {
             didWrite: { [weak self] result in
                 await MainActor.run {
                     guard let self else { return }
-                    if let undo = result.undo {
+                    if chips, let undo = result.undo {
                         self.undoables.append(Undoable(summary: result.summary, action: undo, expires: Date().addingTimeInterval(115)))
                     }
                     Task { await self.refresh() }
@@ -434,7 +435,142 @@ final class ChroniclesConnection {
             return await MainActor.run { self?.newWellness[day] }
         }
         ctx.noteWellnessEntry = { [weak self] day, id in await MainActor.run { self?.newWellness[day] = id } }
+        ctx.taggedEntries = { await MainActor.run { store.taggedEntries } }
         return ctx
+    }
+
+    // MARK: the Today page's checkboxes
+
+    /// Ticks a task done, or back to to-do. False when it couldn't be saved.
+    func setTask(_ id: String, done: Bool) async -> Bool {
+        guard let writer = liveWriter, let n = Int(id) else { return false }
+        return await save { try await writer.setTaskStatus(id: n, status: done ? "done" : "todo") }
+    }
+
+    /// Ticks a priority off or back on, by its place in the list.
+    func setPriority(at index: Int, done: Bool) async -> Bool {
+        await changePriorities { items in
+            guard items.indices.contains(index) else { return nil }
+            var list = items; list[index].done = done; return list
+        }
+    }
+
+    /// Adds a priority at the end of the list (a new list when there isn't one).
+    func addPriority(_ text: String) async -> Bool {
+        let words = text.split(whereSeparator: \.isNewline).joined(separator: " ").trimmingCharacters(in: .whitespaces)
+        guard !words.isEmpty, let writer = liveWriter else { return false }
+        guard let entry = store.snapshot?.priorities?.entryID.flatMap(Int.init) else {
+            guard let topic = await sync?.topicID(named: ["Priorities"]) else {
+                lastError = "There's no Priorities topic in Chronicles yet."; return false
+            }
+            return await save {
+                let shape = ChroniclesShapes.newPriorities([.init(text: words, done: false, id: UUID().uuidString.lowercased())],
+                                                           day: Day.key(), topicID: topic)
+                _ = try await writer.createEntry(content: shape.content, metadata: shape.metadata)
+            }
+        }
+        let item = PriorityList.Item(text: words, done: false, id: UUID().uuidString.lowercased())
+        return await save { try await writer.updatePriorities(entryID: entry) { $0 + [item] } }
+    }
+
+    /// A scheduled dose ticked taken (with its Meals row, as Chronicles adds one), or back to not taken.
+    func setDose(medication: String, medicationID: String, time: String, taken: Bool) async -> Bool {
+        guard let writer = liveWriter, let medID = Int(medicationID) else { return false }
+        let today = Day.key()
+        if taken {
+            // Smith's own dose tool, so a tick here does exactly what "Smith, I took it" does
+            let tool = LogDoseTool(actionContext(estimate: { _, _, _ in nil }, chips: false))
+            return await save {
+                _ = try await tool.run(["medication": .string(medication), "status": "taken", "time": .string(time), "explicit": true])
+            }
+        }
+        let link = MedNutrients.linkKey(medicationID: medID, date: today, time: time)
+        let meal = await sync?.doseLinkEntryID(link)
+        return await save {
+            _ = try await writer.logDose(medicationID: medID, scheduledTime: time, date: today, status: "pending", takenAt: nil)
+            // The Meals row the tick added goes too (if Chronicles lets the app remove it)
+            if let meal { _ = try? await writer.deleteEntry(id: meal) }
+        }
+    }
+
+    /// One more check-in on a habit today, or one fewer.
+    func setHabit(_ id: String, add: Bool) async -> Bool {
+        guard let writer = liveWriter, let n = Int(id) else { return false }
+        let today = Day.key()
+        return await save {
+            if add { _ = try await writer.checkHabit(habitID: n, day: today) } else { try await writer.undo(.uncheckHabit(habitID: n, day: today)) }
+        }
+    }
+
+    /// A routine session ticked done (an Exercise entry, as Chronicles logs it), or unticked (that entry removed).
+    func setExercise(_ slot: DayOverview.ExerciseSlot, done: Bool) async -> Bool {
+        guard let writer = liveWriter else { return false }
+        if !done {
+            guard let id = slot.sessionID.flatMap(Int.init) else { return true }
+            return await save { _ = try await writer.deleteEntry(id: id) }
+        }
+        guard let topic = await sync?.topicID(named: ["Exercise"]) else {
+            lastError = "There's no Exercise topic in Chronicles yet."; return false
+        }
+        guard !hiddenTopicIDs.contains(topic) else {
+            lastError = "Exercise is kept from AI in Chronicles, so Smith can't log it."; return false
+        }
+        return await save { _ = try await writer.logRoutineSession(slot.routine, day: Day.key(), time: slot.time, exerciseTopicID: topic) }
+    }
+
+    /// Adds a win (a new Wins entry for today when there isn't one).
+    func addWin(_ text: String) async -> Bool {
+        let words = text.split(whereSeparator: \.isNewline).joined(separator: " ").trimmingCharacters(in: .whitespaces)
+        guard !words.isEmpty, let writer = liveWriter else { return false }
+        let item = WinsList.Item(text: words)
+        guard let entry = store.snapshot?.wins.flatMap({ Int($0.entryID) }) else {
+            guard let topic = await sync?.topicID(named: ["Wins"]) else {
+                lastError = "There's no Wins topic in Chronicles yet."; return false
+            }
+            return await save {
+                let shape = ChroniclesShapes.newWins([item], day: Day.key(), topicID: topic)
+                _ = try await writer.createEntry(content: shape.content, metadata: shape.metadata)
+            }
+        }
+        return await save { try await writer.updateWins(entryID: entry) { $0 + [item] } }
+    }
+
+    /// Ticks an item on one shopping list got, or back to still to get, by its id.
+    func setShoppingItem(_ id: String, onList listID: String, got: Bool) async -> Bool {
+        guard let writer = liveWriter, let entry = Int(listID) else { return false }
+        return await save {
+            try await writer.updateShopping(entryID: entry) { items in
+                guard let i = items.firstIndex(where: { $0.id == id }) else { return nil }
+                var list = items; list[i].checked = got; return list
+            }
+        }
+    }
+
+    /// Adds an item to one shopping list (category "other", as Chronicles' quick add does).
+    func addShoppingItem(_ name: String, toList listID: String) async -> Bool {
+        let words = name.split(whereSeparator: \.isNewline).joined(separator: " ").trimmingCharacters(in: .whitespaces)
+        guard !words.isEmpty, let writer = liveWriter, let entry = Int(listID) else { return false }
+        let item = ShoppingList.Item(name: words)
+        return await save { try await writer.updateShopping(entryID: entry) { $0 + [item] } }
+    }
+
+    private func changePriorities(_ change: @escaping @Sendable ([PriorityList.Item]) -> [PriorityList.Item]?) async -> Bool {
+        guard let writer = liveWriter, let entry = store.snapshot?.priorities?.entryID.flatMap(Int.init) else { return false }
+        return await save { try await writer.updatePriorities(entryID: entry, change) }
+    }
+
+    /// Saves, then brings Smith's picture of the day up to date.
+    private func save(_ write: () async throws -> Void) async -> Bool {
+        do {
+            try await write()
+            await refresh()
+            return true
+        } catch ChroniclesError.keyChanged {
+            Self.forgetQuickUnlock(); lock(); lastError = ChroniclesError.keyChanged.errorDescription
+        } catch {
+            lastError = "That didn’t save: \(error.localizedDescription)"
+        }
+        return false
     }
 
     func undo(_ item: Undoable) async {
@@ -452,6 +588,9 @@ final class ChroniclesConnection {
             lastError = "Undo didn’t work: \(error.localizedDescription)"
         }
     }
+
+    /// A new answer has started: the last one's Undo pills leave the screen.
+    func clearUndoChips() { undoables = [] }
 
     func dropExpiredUndos(now: Date = Date()) {
         undoables.removeAll { $0.expires <= now }

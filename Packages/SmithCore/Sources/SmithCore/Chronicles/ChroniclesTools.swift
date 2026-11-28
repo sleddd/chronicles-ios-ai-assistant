@@ -18,6 +18,8 @@ public struct ChroniclesActionContext: Sendable {
     public var wellnessEntryID: @Sendable (String) async -> Int? = { _ in nil }
     /// A check-in was just made for this day: the next update must find it, not make another.
     public var noteWellnessEntry: @Sendable (String, Int) async -> Void = { _, _ in }
+    /// Their tagged journal and topic entries Smith may see (empty while journal sharing is off).
+    public var taggedEntries: @Sendable () async -> [TaggedEntry] = { [] }
     public var now: @Sendable () -> Date
     public var timeZone: TimeZone
 
@@ -385,15 +387,23 @@ public struct MarkBillPaidTool: LocalTool {
 
 public enum ChroniclesActionTools {
     public static func all(_ ctx: ChroniclesActionContext) -> [LocalTool] {
-        [LogMealTool(ctx), LogDoseTool(ctx), CheckHabitTool(ctx), SaveNoteTool(ctx), AddTaskTool(ctx), SetTaskStatusTool(ctx), MarkBillPaidTool(ctx), UpdateWellnessTool(ctx)]
+        [LogMealTool(ctx), LogDoseTool(ctx), CheckHabitTool(ctx), SaveNoteTool(ctx), AddTaskTool(ctx), SetTaskStatusTool(ctx),
+         EditTaskTool(ctx), TaskBlockersTool(ctx), DeleteTaskTool(ctx), EditPrioritiesTool(ctx), EditEventTool(ctx), TagEntryTool(ctx),
+         MarkBillPaidTool(ctx), UpdateWellnessTool(ctx)]
     }
 
     /// Added to the persona when Smith is connected to Chronicles.
     public static let persona = """
         You can act in their Chronicles: log meals and doses, check off habits, save notes, add tasks, mark tasks done, \
-        mark bills paid, and update their wellness card (mood, sleep, water, stress and the "Your day" answers). When they directly tell you to do one of these ("Smith, log meal: oatmeal", "mark my vitamin \
-        D taken"), do it and say plainly what you did; they can undo it for two minutes. When you are only inferring it \
-        ("I had oatmeal"), ask first in a natural way ("Want me to log that?"), and act only after they say yes. You \
-        can't delete or change anything else; if they ask, say you can't and that they can do it in Chronicles.
+        change a task (move or reschedule it, or change its title, deadline, priority, goal or type), add or clear what's \
+        blocking a task (another task or a short note), delete a task, change their priorities list, move or change \
+        calendar events, add or remove tags on their journal and topic entries, mark bills paid, and update their \
+        wellness card (mood, sleep, water, stress and the "Your day" answers). When they directly tell you to do one of \
+        these ("Smith, log meal: oatmeal", "move the dentist to Friday"), do it and say plainly what you did; they can \
+        undo it for two minutes. When you are only inferring it ("I had oatmeal", "I can't do the deck until Dana \
+        replies"), ask first in a natural way ("Want me to mark it blocked?"), and act only after they say yes. When a \
+        name could mean more than one task or event, ask which. Delete only tasks, and only when they ask; Chronicles \
+        keeps a copy for two weeks. You can't delete anything else, or change anything not listed here; if they ask, \
+        say you can't and that they can do it in Chronicles.
         """
 }

@@ -87,6 +87,7 @@ public enum ClaudeError: LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .missingKey: return "Add your Anthropic API key in Settings."
+        case .http(401, _): return "Anthropic didn’t accept the API key. Check it in Settings → Claude."
         case .http(let status, let message): return "Claude returned \(status): \(message)"
         case .api(let m): return m
         case .refused: return "Claude declined that request."
@@ -98,11 +99,15 @@ public enum ClaudeError: LocalizedError, Equatable {
 
 public struct URLSessionTransport: ClaudeTransport {
     let apiKey: @Sendable () -> String?
+    /// Another key to try once when the first is turned down (401): Smith's own saved
+    /// key, when the first came from Chronicles. nil = no other key.
+    let fallbackKey: @Sendable () -> String?
     let session: URLSession
     let guardrail: AIGuard
 
-    public init(session: URLSession = .shared, guard guardrail: AIGuard = .shared, apiKey: @escaping @Sendable () -> String?) {
-        self.session = session; self.apiKey = apiKey; self.guardrail = guardrail
+    public init(session: URLSession = .shared, guard guardrail: AIGuard = .shared, apiKey: @escaping @Sendable () -> String?,
+                fallbackKey: @escaping @Sendable () -> String? = { nil }) {
+        self.session = session; self.apiKey = apiKey; self.fallbackKey = fallbackKey; self.guardrail = guardrail
     }
 
     public func stream(_ request: ClaudeRequest) -> AsyncThrowingStream<SSEEvent, Error> {
@@ -124,6 +129,7 @@ public struct URLSessionTransport: ClaudeTransport {
 
                     var bytes: URLSession.AsyncBytes
                     var attempt = 0
+                    var triedFallback = false
                     while true {
                         let (b, response) = try await session.bytes(for: req)
                         let http = response as? HTTPURLResponse
@@ -131,6 +137,12 @@ public struct URLSessionTransport: ClaudeTransport {
                         if status == 200 { bytes = b; break }
                         var text = ""
                         for try await line in b.lines { text += line }
+                        // The key was turned down: the other key, once, if there is a different one
+                        if status == 401, !triedFallback, let other = fallbackKey(), !other.isEmpty, other != key {
+                            triedFallback = true
+                            req.setValue(other, forHTTPHeaderField: "x-api-key")
+                            continue
+                        }
                         // Busy or rate-limited: wait as asked (or a little longer each time) and try
                         // again, twice at most. A 429 with no "retry-after" is a spending limit: not retried.
                         let after = http?.value(forHTTPHeaderField: "retry-after").flatMap(Double.init)

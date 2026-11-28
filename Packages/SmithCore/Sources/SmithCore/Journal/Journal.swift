@@ -22,11 +22,13 @@ public struct JournalRecord: Codable, Equatable, Sendable, Identifiable {
     public var themes: [JournalTheme]
     /// One neutral line, made on the device. Stays on the device; never sent to the AI.
     public var summaryLine: String?
+    /// The entry's own tags from Chronicles (`tags`), as they wrote them. Optional for older records.
+    public var tags: [String]? = nil
 
     public init(id: String, day: String, topicIDs: [String], fingerprint: String,
-                tone: JournalTone? = nil, themes: [JournalTheme] = [], summaryLine: String? = nil) {
+                tone: JournalTone? = nil, themes: [JournalTheme] = [], summaryLine: String? = nil, tags: [String]? = nil) {
         self.id = id; self.day = day; self.topicIDs = topicIDs; self.fingerprint = fingerprint
-        self.tone = tone; self.themes = themes; self.summaryLine = summaryLine
+        self.tone = tone; self.themes = themes; self.summaryLine = summaryLine; self.tags = tags
     }
 
     public static func fingerprint(of text: String) -> String {
@@ -60,8 +62,9 @@ public struct TransientJournalEntry: Sendable {
     public var day: String
     public var topicIDs: [String]
     public var text: String
-    public init(id: String, day: String, topicIDs: [String], text: String) {
-        self.id = id; self.day = day; self.topicIDs = topicIDs; self.text = text
+    public var tags: [String]
+    public init(id: String, day: String, topicIDs: [String], text: String, tags: [String] = []) {
+        self.id = id; self.day = day; self.topicIDs = topicIDs; self.text = text; self.tags = tags
     }
 }
 
@@ -76,12 +79,13 @@ public enum JournalVaultBuilder {
             let fp = JournalRecord.fingerprint(of: e.text)
             let excluded = !neverMention.isDisjoint(with: e.topicIDs)
             if var old = existing[e.id], old.fingerprint == fp {
-                old.day = e.day; old.topicIDs = e.topicIDs
+                old.day = e.day; old.topicIDs = e.topicIDs; old.tags = e.tags.isEmpty ? nil : e.tags
                 if excluded { old.tone = nil; old.themes = []; old.summaryLine = nil }
                 out.append(old)
                 continue
             }
             var r = JournalRecord(id: e.id, day: e.day, topicIDs: e.topicIDs, fingerprint: fp)
+            r.tags = e.tags.isEmpty ? nil : e.tags
             if !excluded, !e.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                let s = await summarizer.summarize(e.text) {
                 r.tone = s.tone

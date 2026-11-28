@@ -20,9 +20,72 @@ public struct PlanTask: Codable, Equatable, Sendable, Identifiable {
     public var milestoneID: String?
     public var openChecklistItems: Int
     public var createdDay: String?
+    /// Chronicles' task type ("Regular task", "Small victory" or one of their own), nil when unset.
+    public var taskType: String? = nil
+    /// What's in the way ("Blocked by"). Optional so a snapshot saved before blockers were read still opens.
+    public var blockerList: [TaskBlocker]? = nil
 
     public var isOpen: Bool { status != .done }
     public var priorityRank: Int { ["urgent": 0, "high": 1, "medium": 2, "low": 3][priority] ?? 4 }
+    public var blockers: [TaskBlocker] { blockerList ?? [] }
+
+    /// The blockers still in the way: notes, and tasks that are still open. A task
+    /// that is done, or isn't there any more, no longer blocks (Chronicles' rule).
+    public func openBlockers(in tasks: [PlanTask]) -> [TaskBlocker] {
+        blockers.filter { b in
+            guard let other = b.taskID else { return true }
+            return tasks.first { $0.id == other }?.isOpen ?? false
+        }
+    }
+
+    /// "Get passport", "waiting on Dana's reply": each open blocker in words.
+    public func blockerWords(in tasks: [PlanTask]) -> [String] {
+        openBlockers(in: tasks).map { b in
+            b.note ?? tasks.first { $0.id == b.taskID }?.title ?? "another task"
+        }
+    }
+}
+
+/// One "Blocked by" line on a task: another task (cleared once it's done) or a short note.
+public struct TaskBlocker: Codable, Equatable, Sendable, Identifiable {
+    public var id: String
+    public var taskID: String?
+    public var note: String?
+    public init(id: String = UUID().uuidString.lowercased(), taskID: String? = nil, note: String? = nil) {
+        self.id = id; self.taskID = taskID; self.note = note
+    }
+
+    public static let maxPerTask = 10
+    public static let maxNote = 200
+
+    /// A note made tidy, the way Chronicles keeps it: one line, single spaces, at most 200 characters.
+    public static func cleanNote(_ raw: String) -> String {
+        let oneLine = raw.unicodeScalars.map { CharacterSet.controlCharacters.contains($0) ? " " : String($0) }.joined()
+        return String(oneLine.split(whereSeparator: \.isWhitespace).joined(separator: " ").prefix(maxNote))
+    }
+
+    /// The blockers in a task's fields (`blockers`): each valid one once, at most 10.
+    public static func list(from v: JSONValue?) -> [TaskBlocker] {
+        var out: [TaskBlocker] = []
+        for item in v?.array ?? [] {
+            guard out.count < maxPerTask else { break }
+            let id = item["id"]?.string.flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString.lowercased()
+            if let n = item["taskId"]?.int {
+                let t = String(n)
+                if !out.contains(where: { $0.taskID == t }) { out.append(TaskBlocker(id: id, taskID: t)) }
+            } else if let raw = item["note"]?.string {
+                let note = cleanNote(raw)
+                if !note.isEmpty, !out.contains(where: { $0.note?.lowercased() == note.lowercased() }) { out.append(TaskBlocker(id: id, note: note)) }
+            }
+        }
+        return out
+    }
+
+    /// As Chronicles stores it: `{ id, taskId }` or `{ id, note }`.
+    public var json: JSONValue {
+        if let t = taskID, let n = Int(t) { return ["id": .string(id), "taskId": .number(Double(n))] }
+        return ["id": .string(id), "note": .string(note ?? "")]
+    }
 }
 
 public struct Goal: Codable, Equatable, Sendable, Identifiable {
@@ -96,6 +159,84 @@ public struct Habit: Codable, Equatable, Sendable, Identifiable {
     }
 }
 
+/// An exercise routine (Chronicles' Exercise Routine topic): a row on each day's
+/// checklist at each of its times. Ticking it logs an Exercise entry for that slot.
+public struct Routine: Codable, Equatable, Sendable, Identifiable {
+    public var id: String
+    public var name: String
+    public var exerciseType: String
+    /// Minutes for a full session (typed, else the sum of the "N min" items)
+    public var minutes: Int
+    public var itemIDs: [String]
+    /// 0 = Sunday; empty = every day
+    public var days: [Int]
+    public var times: [String]
+    public var trainingCategory: String
+
+    public func runs(on day: String) -> Bool { days.isEmpty || days.contains(Day.weekday(day) - 1) }
+
+    /// Chronicles' routineLinkKey: "<routineId>|<date>|<HH:MM>".
+    public func linkKey(day: String, time: String) -> String {
+        let t = String(time.prefix(5))
+        return "\(id)|\(day)|\(t.count == 4 ? "0" + t : t)"
+    }
+
+    static let typeLabels = ["walking": "Walking", "running": "Running", "cycling": "Cycling", "swimming": "Swimming",
+                             "strength": "Strength Training", "yoga": "Yoga", "balance": "Balance", "breathing": "Breathing",
+                             "cardio": "Cardio", "other": "Other"]
+
+    /// Chronicles' sessionFields for a full session.
+    public func sessionFields(day: String, time: String) -> [String: JSONValue] {
+        var f: [String: JSONValue] = [
+            "exerciseType": .string(exerciseType), "duration": .string(minutes > 0 ? String(minutes) : ""),
+            "intensity": "medium", "distance": "", "distanceUnit": "miles", "calories": "",
+            "performedDate": .string(day), "performedTime": .string(String(time.prefix(5))), "notes": "",
+            "routineId": .number(Double(Int(id) ?? 0)), "routineItemsDone": .array(itemIDs.map { .string($0) }),
+        ]
+        if !trainingCategory.isEmpty { f["trainingCategory"] = .string(trainingCategory) }
+        return f
+    }
+
+    /// Chronicles' sessionTitle: "Morning yoga · Yoga · 30 min".
+    public var sessionTitle: String {
+        [name, Self.typeLabels[exerciseType] ?? exerciseType, minutes > 0 ? "\(minutes) min" : ""].filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+}
+
+/// A book, movie, TV show or album from their Media journal (no cover image, no link).
+public struct MediaItem: Codable, Equatable, Sendable, Identifiable {
+    public var id: String
+    public var title: String
+    /// book / movie / tv / music
+    public var type: String
+    public var creator: String
+    public var album: String
+    public var season: String
+    public var year: String
+    public var genre: String
+    /// 0 = unrated, else 0.5 … 5
+    public var rating: Double
+    /// current / want / done / paused / dnf, "" = no shelf
+    public var shelf: String
+    /// 0–100
+    public var progress: Int
+    public var notes: String
+    public var tags: [String]
+
+    /// "Reading" / "Want to watch" / "Listened" — Chronicles' shelf names for the type.
+    public var shelfLabel: String {
+        let verb = type == "book" ? "read" : type == "music" ? "listen" : "watch"
+        switch shelf {
+        case "current": return verb == "read" ? "Reading" : verb == "listen" ? "Listening" : "Watching"
+        case "want": return "Want to \(verb)"
+        case "done": return verb == "read" ? "Read" : verb == "listen" ? "Listened" : "Watched"
+        case "paused": return "Paused"
+        case "dnf": return "Didn't finish"
+        default: return "No shelf"
+        }
+    }
+}
+
 public struct Medication: Codable, Equatable, Sendable, Identifiable {
     public var id: String
     public var name: String
@@ -117,8 +258,44 @@ public struct DoseLog: Codable, Equatable, Sendable {
 }
 
 public struct PriorityList: Codable, Equatable, Sendable {
-    public struct Item: Codable, Equatable, Sendable { public var text: String; public var done: Bool }
+    public struct Item: Codable, Equatable, Sendable {
+        public var text: String
+        public var done: Bool
+        /// Chronicles' id for the item (kept so a rewrite doesn't lose it).
+        public var id: String? = nil
+        public init(text: String, done: Bool, id: String? = nil) { self.text = text; self.done = done; self.id = id }
+    }
     public var day: String
+    public var items: [Item]
+    /// The Priorities entry this list is (the newest one, which Chronicles' dashboard shows).
+    public var entryID: String? = nil
+}
+
+/// The Wins list Chronicles' dashboard shows: its newest Wins entry (it carries over midnight).
+public struct WinsList: Codable, Equatable, Sendable {
+    public struct Item: Codable, Equatable, Sendable {
+        public var id: String
+        public var text: String
+        public init(id: String = UUID().uuidString.lowercased(), text: String) { self.id = id; self.text = text }
+    }
+    public var entryID: String
+    public var day: String
+    public var items: [Item]
+}
+
+/// A shopping list that's still active: empty, or with something still to get (Chronicles' rule).
+public struct ShoppingList: Codable, Equatable, Sendable {
+    public struct Item: Codable, Equatable, Sendable {
+        public var id: String
+        public var name: String
+        public var category: String
+        public var checked: Bool
+        public init(id: String = UUID().uuidString.lowercased(), name: String, category: String = "other", checked: Bool = false) {
+            self.id = id; self.name = name; self.category = category; self.checked = checked
+        }
+    }
+    public var entryID: String
+    public var title: String
     public var items: [Item]
 }
 
@@ -214,6 +391,25 @@ public struct ChroniclesSnapshot: Codable, Equatable, Sendable {
     /// Optional so a snapshot saved before this was read still opens.
     public var allergyList: [String]?
     public var allergies: [String] { allergyList ?? [] }
+    /// Today's wins, and every active shopping list, newest first (optional, so older saved snapshots still open).
+    public var wins: WinsList?
+    public var shoppingLists: [ShoppingList]?
+    /// Exercise routines, and the sessions logged from them in the last week (link key → entry id).
+    public var routines: [Routine]?
+    /// Their Media journal: books, movies, TV and music, with their notes.
+    public var media: [MediaItem]?
+    public var routineSessions: [String: String]?
+    /// The task types they've added in Chronicles (the built-in two aren't listed). Optional for older snapshots.
+    public var customTaskTypes: [String]?
+    /// Every task type to offer: Chronicles' built-in ones, then theirs.
+    public var taskTypes: [String] {
+        var out: [String] = []
+        for t in ["Regular task", "Small victory"] + (customTaskTypes ?? []) {
+            let clean = t.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            if !clean.isEmpty, !out.contains(where: { $0.lowercased() == clean.lowercased() }) { out.append(clean) }
+        }
+        return out
+    }
 
     public init(exportedAt: Date) { self.exportedAt = exportedAt }
 }

@@ -41,14 +41,23 @@ struct HomeView: View {
                             .padding(.horizontal, 28)
                             .contentTransition(.opacity)
                             .animation(.easeInOut(duration: 0.6), value: brain.headline)
-                        // Stats hidden: the greeting and the orb sit together in the middle
-                        if app.store.settings.statsHidden { orbBlock.padding(.top, 18) }
+                        // The greeting and the orb sit together in the middle
+                        orbBlock.padding(.top, 18)
                     }
                     Spacer(minLength: 12)
                 }
                 if app.page == .home {
-                    if app.showChat || !app.store.settings.statsHidden { orbBlock }
-                    inputArea
+                    if app.showChat {
+                        // The fixed part under the chat: a hairline on top sets it apart from the bubbles
+                        VStack(spacing: 0) {
+                            Rectangle().fill(.white.opacity(0.1)).frame(height: 1)
+                                .frame(maxWidth: Self.contentWidth).padding(.horizontal, sidePadding)
+                            orbBlock.padding(.top, 16)
+                            inputArea
+                        }
+                    } else {
+                        inputArea
+                    }
                 }
             }
             if let msg = app.importMessage { banner(msg) }
@@ -122,41 +131,21 @@ struct HomeView: View {
                 chroniclesPill
                 gearMenu
             }
-            if app.page == .home && !app.showChat && !app.store.settings.statsHidden {
-                // Tap the card for the whole day
-                statsCard.contentShape(Rectangle()).onTapGesture { app.page = .today }
-                    .help("Open today's details")
-            }
         }
         .frame(maxWidth: Self.contentWidth)
         .padding(.horizontal, sidePadding).padding(.top, compact ? 12 : 22)
         .frame(maxWidth: .infinity)
     }
 
-    /// Today is home; Goals, Me and Letters open over it.
+    /// Home is the greeting and the orb; Today, Goals, Me and Letters open as pages.
     private var tabs: some View {
         HStack(spacing: compact ? 16 : 30) {
-            tab("Today", selected: app.page == .home || app.page == .today) { app.page = .home }
+            tab("Home", selected: app.page == .home) { app.page = .home }
+            tab("Today", selected: app.page == .today) { app.page = .today }
             tab("Goals", selected: app.page == .goals) { app.page = .goals }
             tab("Me", selected: app.page == .me) { app.page = .me }
             tab("Letters", selected: app.page == .letters) { app.page = .letters }
-            if app.page == .home && !app.showChat { statsMenu }
         }
-    }
-
-    /// One button: hide or show the stats card.
-    private var statsMenu: some View {
-        let hidden = app.store.settings.statsHidden
-        return Button { app.store.updateLocalSettings { $0.statsHidden.toggle() } } label: {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(hidden ? "SHOW STATS" : "HIDE STATS").font(Theme.rounded(compact ? 11 : 13, .medium)).tracking(2.2)
-                    .foregroundStyle(Theme.dim)
-                Capsule().fill(.clear).frame(height: 2.5)
-            }
-            .fixedSize()
-            .padding(.top, 10)
-        }
-        .buttonStyle(.plain)
     }
 
     private func tab(_ title: String, selected: Bool = false, action: @escaping () -> Void) -> some View {
@@ -221,100 +210,12 @@ struct HomeView: View {
         .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize().help("Settings and account")
     }
 
-    /// One glass card: the time with date and weather, events, tasks and priorities.
-    private var statsCard: some View {
-        let o = app.brain.overviewForDisplay()
-        let nowHM = Date().formatted(.verbatim("\(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits)", timeZone: .current, calendar: .current))
-        let remaining = o?.events.filter { $0.allDay || ($0.endTime ?? $0.time ?? "") >= nowHM } ?? []
-        let next = remaining.first { !$0.allDay }
-        let overdue = o?.overdue.count ?? 0
-        let tasks = o.map { $0.openTasksToday + overdue }
-
-        // The date ("Wed" over a small "Nov 25"), then the time with the weather under it
-        let date = TimelineView(.everyMinute) { tl in
-            stat(value: tl.date.formatted(.dateTime.weekday(.abbreviated)),
-                 label: Text(tl.date.formatted(.dateTime.month(.abbreviated).day())))
-        }
-        let clock = TimelineView(.everyMinute) { tl in
-            let full = tl.date.formatted(date: .omitted, time: .shortened)
-            // "11:27 PM" (macOS puts a narrow no-break space before PM)
-            let parts = full.split(maxSplits: 1, whereSeparator: { $0.isWhitespace }).map(String.init)
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .firstTextBaseline, spacing: 5) {
-                    Text(parts.first ?? full).font(Theme.rounded(compact ? 18 : 21, .light))
-                    if parts.count > 1 { Text(parts[1]).font(Theme.rounded(compact ? 9 : 11)).foregroundStyle(Theme.dim) }
-                }
-                .foregroundStyle(Theme.text)
-                HStack(spacing: 8) {
-                    if let w = app.weather.report {
-                        Image(systemName: Self.weatherSymbol(w.description)).foregroundStyle(Theme.teal)
-                        Text("\(w.chip) \(w.description)")
-                    } else {
-                        Text("Time")
-                    }
-                }
-                .font(Theme.rounded(compact ? 11 : 13)).foregroundStyle(Theme.dim).lineLimit(1).minimumScaleFactor(0.85)
-            }
-        }
-        let allDay = remaining.first { $0.allDay }
-        let eventLabel = next.map { "Next: \($0.time ?? "") \($0.title)" }
-            ?? allDay.map { "All day: \($0.title)" }
-            ?? ((o?.events.isEmpty ?? true) ? "No events today" : "No more events")
-        let events = stat(value: "\(remaining.count)", label: Text(eventLabel))
-        let taskStat = stat(value: tasks.map(String.init) ?? "—", tint: overdue > 0 ? Theme.amber : nil,
-                            label: overdue > 0 ? Text("Tasks · ") + Text("\(overdue) overdue").foregroundColor(Theme.amber) : Text("Tasks today"))
-        let priorities = stat(value: o.map { "\($0.priorities.count)" } ?? "—", label: Text("Priorities"))
-        let divider = Rectangle().fill(.white.opacity(0.09)).frame(width: 1, height: compact ? 30 : 38)
-
-        return ViewThatFits(in: .horizontal) {
-            HStack(spacing: 0) {
-                // The date and time take just the room they need; the counts share the rest
-                date.fixedSize().padding(.trailing, 28)
-                divider
-                clock.fixedSize().padding(.horizontal, 28)
-                divider
-                events.frame(maxWidth: .infinity, alignment: .leading).padding(.leading, 28).padding(.trailing, 10)
-                divider
-                taskStat.frame(maxWidth: .infinity, alignment: .leading).padding(.leading, 28).padding(.trailing, 10)
-                divider
-                priorities.frame(maxWidth: .infinity, alignment: .leading).padding(.leading, 28)
-            }
-            // Narrow (the floating panel, a small window): two by two
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 120), alignment: .leading)], alignment: .leading, spacing: 16) {
-                date; clock; events; taskStat; priorities
-            }
-        }
-        .padding(.horizontal, compact ? 18 : 32).padding(.vertical, compact ? 12 : 18)
-        .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
-        .background(.ultraThinMaterial.opacity(0.5), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(.white.opacity(0.09)))
-    }
-
-    private func stat(value: String, tint: Color? = nil, label: Text) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(value).font(Theme.rounded(compact ? 18 : 21, .light)).foregroundStyle(tint ?? Theme.text)
-            label.font(Theme.rounded(compact ? 11 : 13)).foregroundStyle(Theme.dim).lineLimit(1).minimumScaleFactor(0.85)
-        }
-    }
-
-    static func weatherSymbol(_ description: String) -> String {
-        switch description.lowercased() {
-        case "clear": "sun.max"
-        case "mostly clear", "partly cloudy": "cloud.sun"
-        case "foggy": "cloud.fog"
-        case "drizzle", "rain", "showers": "cloud.rain"
-        case "snow", "snow showers": "cloud.snow"
-        case "thunderstorms": "cloud.bolt"
-        default: "cloud"
-        }
-    }
-
     // MARK: orb and corners
 
     /// The orb, any notice, and the hint under it.
     private var orbBlock: some View {
         VStack(spacing: 6) {
-            OrbView(mode: orbMode, level: app.voice.level, size: app.showChat ? (compact ? 56 : 72) : (compact ? 80 : 112))
+            OrbView(mode: orbMode, level: app.voice.level, size: app.showChat ? (compact ? 40 : 50) : (compact ? 80 : 112))
                 .contentShape(Circle())
                 .onTapGesture { app.orbTapped() }
                 .onLongPressGesture(minimumDuration: 0.5) { app.orbHeld() }
@@ -363,12 +264,38 @@ struct HomeView: View {
     }
 }
 
+/// Both chat bubbles, theirs and Smith's: glass, like the stats card — a faint
+/// tint over a light frosted material, so the background shows through — with
+/// a hairline edge, rounded, no point.
+enum ChatBubbleStyle {
+    static let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
+    static let edge = Color.white.opacity(0.09)
+}
+
+extension View {
+    /// Light glass for their messages, dark glass for Smith's: both let the background show through.
+    func glassBubble(dark: Bool = false) -> some View {
+        background(dark ? Color.black.opacity(0.28) : Color.white.opacity(0.09), in: ChatBubbleStyle.shape)
+            .background(.ultraThinMaterial.opacity(dark ? 0.35 : 0.5), in: ChatBubbleStyle.shape)
+            .overlay(ChatBubbleStyle.shape.stroke(dark ? Color.white.opacity(0.06) : ChatBubbleStyle.edge))
+    }
+}
+
+/// The pills under an answer ("will remember", "Changed … · Undo"): faded like
+/// Smith's own bubble, so they sit back while their text still reads.
+enum ChatPill {
+    static let fill = Color.white.opacity(0.07)
+    static let edge = Color.white.opacity(0.05)
+}
+
 /// Same background; your messages are white pills on the right, Smith's are plain text with a thin accent bar.
 struct ChatView: View {
     @Environment(AppModel.self) private var app
     @State private var editing: Fact?
     /// The reply being heard again.
     @State private var replayingID: UUID?
+    /// Each of Smith's bubbles' width, so the row under it stays within its edges.
+    @State private var bubbleWidths: [UUID: CGFloat] = [:]
 
     var body: some View {
         let brain = app.brain
@@ -381,13 +308,20 @@ struct ChatView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         ForEach(brain.lines) { line in row(line).id(line.id) }
-                        if let w = brain.workingOn { Caps(w, size: 9).padding(.leading, 14) }
-                        else if brain.isThinking { ProgressView().controlSize(.small).padding(.leading, 14) }
+                        // Working: a spinner, and what it's doing when it's using a tool
+                        if brain.isThinking {
+                            HStack(spacing: 10) {
+                                ProgressView().controlSize(.small)
+                                if let w = brain.workingOn { Caps(w, size: 9) }
+                            }
+                            .padding(.leading, 14)
+                        }
                         ForEach(brain.noted) { f in notedPill(f) }
                         UndoChips()
                         Color.clear.frame(height: 1).id("bottom")
                     }
-                    .padding(.horizontal, 22).padding(.vertical, 16)
+                    // A good gap under the tabs before the first bubble
+                    .padding(.horizontal, 22).padding(.top, 48).padding(.bottom, 16)
                 }
                 .onChange(of: brain.lines) { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
                 .onAppear { proxy.scrollTo("bottom", anchor: .bottom) }
@@ -405,9 +339,8 @@ struct ChatView: View {
                     Spacer(minLength: 50)
                     Text(line.text).font(Theme.rounded(15, .regular)).foregroundStyle(Theme.soft)
                         .lineSpacing(5).textSelection(.enabled)
-                        .padding(.leading, 16).padding(.trailing, 16 + ChatBubble.tail).padding(.vertical, 11)
-                        .background(ChatBubble(tailOnRight: true).fill(Color.black.opacity(0.78)))
-                        .overlay(ChatBubble(tailOnRight: true).stroke(.white.opacity(0.06)))
+                        .padding(.horizontal, 16).padding(.vertical, 16)
+                        .glassBubble()
                 }
                 if isLast {
                     // The latest message can be taken back: to fix and send again, or gone
@@ -426,15 +359,16 @@ struct ChatView: View {
                 Button("Start over") { app.startOver() }
             }
         case .smith:
-            // A light, faded bubble with its point on the left; emotes in soft italics
-            VStack(alignment: .leading, spacing: 6) {
+            // The same see-through bubble as theirs, no point; emotes in soft italics
+            // (a little room between the bubble and the hear / regenerate row under it)
+            VStack(alignment: .leading, spacing: 12) {
                 HStack {
                     emoteText(line.text, emote: Theme.dim)
                         .font(Theme.rounded(16)).foregroundStyle(Theme.soft).lineSpacing(7).textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
-                        .padding(.leading, 16 + ChatBubble.tail).padding(.trailing, 16).padding(.vertical, 13)
-                        .background(ChatBubble(tailOnRight: false).fill(Color.white.opacity(0.07)))
-                        .overlay(ChatBubble(tailOnRight: false).stroke(.white.opacity(0.05)))
+                        .padding(.horizontal, 16).padding(.vertical, 18)
+                        .glassBubble(dark: true)
+                        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { bubbleWidths[line.id] = $0 }
                     Spacer(minLength: 40)
                 }
                 // Hear it again (loading while the voice is made, Stop while it plays)
@@ -457,12 +391,21 @@ struct ChatView: View {
                     }
                 }
                 // One row: hear it, regenerate, then "What was sent" to their right (its details open below)
-                if let sent = line.sent {
-                    SentDisclosure(info: sent) { controls }.padding(.leading, 14 + ChatBubble.tail)
-                } else {
-                    controls.padding(.leading, 14 + ChatBubble.tail)
+                // No wider than the bubble above: from its left edge (inset 14) to its right edge
+                // Inset 14 at both ends, so "Sent to Claude" sits fully under the bubble
+                let rowWidth = bubbleWidths[line.id].map { max(0, $0 - 28) }
+                Group {
+                    if let sent = line.sent {
+                        SentDisclosure(info: sent) { controls }
+                    } else {
+                        controls
+                    }
                 }
+                .frame(width: rowWidth, alignment: .leading)
+                .padding(.leading, 14)
             }
+            // Room under the hear / regenerate row before the next bubble
+            .padding(.bottom, 14)
         case .note:
             Caps(line.text, size: 9, color: Theme.faint)
         case .resources:
@@ -471,14 +414,16 @@ struct ChatView: View {
     }
 
     private func notedPill(_ f: Fact) -> some View {
-        HStack(spacing: 10) {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
             Text("\(app.store.settings.name) will remember: \(f.text)").font(Theme.rounded(13, .regular)).foregroundStyle(Theme.soft)
+                .lineSpacing(5).fixedSize(horizontal: false, vertical: true)
             Button("Edit") { editing = f }.buttonStyle(.plain).font(Theme.rounded(12, .medium)).foregroundStyle(Theme.violet)
             Button("Undo") { app.store.aboutYou.delete(f.id, marker: nil); app.brain.dismissNoted(f.id) }
                 .buttonStyle(.plain).font(Theme.rounded(12, .medium)).foregroundStyle(Theme.dim)
         }
-        .padding(.horizontal, 14).padding(.vertical, 8)
-        .background(Color.black.opacity(0.6), in: Capsule())
+        .padding(.horizontal, 16).padding(.vertical, 11)
+        .background(ChatPill.fill, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(ChatPill.edge))
     }
 }
 
@@ -506,6 +451,10 @@ struct InputBar: View {
             if !text.isEmpty && !listening {
                 Button(action: onSend) { Image(systemName: "arrow.up.circle.fill").font(.system(size: 20)).foregroundStyle(Theme.violet) }
                     .buttonStyle(.plain)
+            }
+            // Thinking: a small spinner, so it's plain something is happening
+            if app.brain.isThinking {
+                ProgressView().controlSize(.small).transition(.opacity).help("Smith is working on it")
             }
             // Stop: listening, speaking or an answer on its way (Esc does the same)
             if app.isBusy {

@@ -76,7 +76,9 @@ Smith keeps its own permanent **SwiftData** database on each device. Smith alway
 - **Claude via the Anthropic Messages API.** Your API key is stored in the Keychain. Default model: `claude-sonnet-5-5` for quick replies, with Opus available as a choice. I'll load the `claude-api` skill before writing this part.
 - **Tools Smith can call:**
   - `web_search` (Anthropic's server-side search tool) for research
-  - local tools: `today_overview`, `find_tasks`, `goals_progress`, `bills_due`, `journal_summary`, `weather`, `current_time`
+  - local tools: `today_overview`, `find_tasks`, `goals_progress`, `bills_due`, `journal_summary`, `find_tags`, `weather`, `current_time`
+  - `find_tags` lists the tags on journal and topic entries, and which entries have a tag: the day, topic and tags only, never entry text. It returns nothing while journal sharing is off, leaves out "never mention" topics, and isn't offered through Siri.
+  - Chronicles actions (while unlocked): log meals and doses, check off habits, save notes, add tasks, set a task's status, `edit_task` (move, reschedule, rename; deadline, priority, goal, type), `task_blockers` (a task's "Blocked by" line: another task, or a short note), `delete_task` (tasks only; Chronicles keeps a copy for two weeks), `edit_priorities`, `edit_event` (a repeating event changes only after they confirm the whole series), `tag_entry`, mark bills paid, and the wellness card. Each asks first unless they asked directly, and has a two-minute Undo.
   - `bills_due` returns names and dates only, for example "Rent, due Mon 1 Dec, not paid yet" or "Netflix, Thu, autopay". It never returns amounts.
   - There is **no** `search_journal` tool. `journal_summary` returns only the approved general summary from section 8, never entry text.
 - **The persona prompt: Claude's warmth, written in the Chronicles style.** It's built on Chronicles' `CHAT_PERSONA` (`client/src/utils/chatSave.ts`), so Smith sounds like the assistant you already like.

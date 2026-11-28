@@ -154,6 +154,13 @@ final class SmithStore {
             .text(today: today, mode: settings.journalMode)
     }
 
+    /// Tagged journal and topic entries Smith may see: none while journal sharing is
+    /// off, never one in a "never mention" topic. Day, topic and tags only.
+    var taggedEntries: [TaggedEntry] {
+        TaggedEntry.visible(journal, mode: settings.journalMode, neverMention: settings.neverMentionTopics,
+                            topics: snapshot?.topics ?? [:])
+    }
+
     // MARK: conversations
 
     func addConversation(_ summary: ConversationSummary) {

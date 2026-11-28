@@ -661,4 +661,9 @@ public actor ChroniclesLiveSync {
     public func hasDoseLink(_ key: String) -> Bool {
         entries.values.contains { $0.metadata["_doseLink"]?.string == key }
     }
+
+    /// The Meals row linked to a dose, if there is one.
+    public func doseLinkEntryID(_ key: String) -> Int? {
+        entries.values.first { $0.metadata["_doseLink"]?.string == key }?.id
+    }
 }

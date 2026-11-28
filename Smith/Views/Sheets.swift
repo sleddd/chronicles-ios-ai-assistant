@@ -1,18 +1,35 @@
 import SwiftUI
 import SmithCore
 
+/// Today: the schedule, the tasks to do, and the priorities. Checkboxes only
+/// while Smith is connected to Chronicles, where ticking one saves it there.
 struct TodaySheet: View {
     @Environment(AppModel.self) private var app
+    /// Ticked here and not yet back from Chronicles: shown at once, put back if the save fails.
+    @State private var taskTicks: [String: Bool] = [:]
+    @State private var priorityTicks: [Int: Bool] = [:]
+    @State private var newPriority = ""
+    @State private var shoppingTicks: [String: Bool] = [:]
+    @State private var doseTicks: [String: Bool] = [:]
+    @State private var habitCounts: [String: Int] = [:]
+    @State private var exerciseTicks: [String: Bool] = [:]
+    /// The shopping list picked here (its entry id); remembered on this device only.
+    @AppStorage("todayShoppingList") private var chosenList = ""
+    @State private var newWin = ""
+    @State private var newItem = ""
 
     var body: some View {
-        GlassSheet(title: "Today") {
+        GlassSheet(title: "") {
             if let o = app.brain.overviewForDisplay() {
-                SectionLabel("Events")
+                let canTick = app.chronicles.isUnlocked
+                // The first heading sits at the top (no title row above it)
+                Caps("Schedule", size: 11).padding(.bottom, 4)
                 GlassCard {
                     if o.events.isEmpty { Text("Nothing on the calendar.").foregroundStyle(Theme.dim) }
                     ForEach(Array(o.events.enumerated()), id: \.offset) { _, e in
                         HStack(alignment: .firstTextBaseline) {
-                            Text(e.allDay ? "All day" : (e.time ?? "")).font(Theme.rounded(13, .regular)).foregroundStyle(Theme.dim).frame(width: 64, alignment: .leading)
+                            Text(e.allDay ? "All day" : [e.time, e.endTime].compactMap { $0 }.joined(separator: "–"))
+                                .font(Theme.rounded(13, .regular)).foregroundStyle(Theme.dim).frame(width: 96, alignment: .leading)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(e.title).font(Theme.rounded(15, .regular))
                                 if let l = e.location { Text(l).font(Theme.rounded(12)).foregroundStyle(Theme.dim) }
@@ -22,66 +39,245 @@ struct TodaySheet: View {
                 }
                 SectionLabel("Tasks")
                 GlassCard {
-                    if o.tasksToday.isEmpty { Text("No tasks planned for today.").foregroundStyle(Theme.dim) }
-                    ForEach(o.tasksToday) { t in taskRow(t) }
-                }
-                if !o.overdue.isEmpty {
-                    SectionLabel("Overdue")
-                    GlassCard { ForEach(o.overdue) { t in taskRow(t) } }
-                }
-                if !o.deadlinesSoon.isEmpty {
-                    SectionLabel("Coming up")
-                    GlassCard {
-                        ForEach(o.deadlinesSoon) { t in
-                            HStack { Text(t.title); Spacer(); Text(Day.relative(t.deadline ?? "", today: o.today)).foregroundStyle(Theme.dim) }
-                                .font(Theme.rounded(14))
-                        }
-                    }
+                    let tasks = o.tasksToday + o.overdue
+                    if tasks.isEmpty { Text("No tasks for today.").foregroundStyle(Theme.dim) }
+                    ForEach(tasks) { t in taskRow(t, o, canTick: canTick) }
                 }
                 if !o.doses.isEmpty {
-                    SectionLabel("Doses")
+                    SectionLabel("Medications")
                     GlassCard {
                         ForEach(Array(o.doses.enumerated()), id: \.offset) { _, d in
-                            HStack {
-                                Text(d.time).foregroundStyle(Theme.dim).frame(width: 52, alignment: .leading)
-                                Text("\(d.medication) \(d.dosage)")
+                            let key = "\(d.medicationID)|\(d.time)"
+                            let taken = doseTicks[key] ?? (d.status == "taken")
+                            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                if canTick { checkbox(taken) { tickDose(d, key: key, !taken) } } else { Text("·").foregroundStyle(Theme.dim) }
+                                Text(d.time).font(Theme.rounded(13, .regular)).foregroundStyle(Theme.dim).frame(width: 46, alignment: .leading)
+                                Text([d.medication, d.dosage].filter { !$0.isEmpty }.joined(separator: " "))
+                                    .font(Theme.rounded(15, .regular)).strikethrough(taken, color: Theme.dim)
+                                    .foregroundStyle(taken ? Theme.dim : Theme.text)
                                 Spacer()
-                                Caps(d.status, size: 8.5, color: d.status == "taken" ? Theme.teal : Theme.dim)
-                            }.font(Theme.rounded(14))
+                                if d.status == "skipped" && doseTicks[key] == nil { Caps("skipped", size: 8.5) }
+                            }
                         }
                     }
                 }
-                if !o.bills.isEmpty {
-                    SectionLabel("Bills due")
+                if !o.habits.isEmpty {
+                    SectionLabel("Habits")
                     GlassCard {
-                        ForEach(Array(o.bills.enumerated()), id: \.offset) { _, b in
-                            HStack {
-                                Text(b.name)
+                        ForEach(o.habits, id: \.id) { h in
+                            let count = habitCounts[h.id] ?? h.count
+                            let done = count >= h.target
+                            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                if canTick { checkbox(done) { tickHabit(h, count: count) } } else { Text("·").foregroundStyle(Theme.dim) }
+                                Text(h.name).font(Theme.rounded(15, .regular)).strikethrough(done, color: Theme.dim)
+                                    .foregroundStyle(done ? Theme.dim : Theme.text)
                                 Spacer()
-                                Text(Day.relative(b.due, today: o.today)).foregroundStyle(Theme.dim)
-                                Caps(b.paid ? "paid" : b.autopay ? "autopay" : "unpaid", size: 8.5, color: b.paid ? Theme.teal : Theme.dim)
-                            }.font(Theme.rounded(14))
+                                if h.target > 1 { Text("\(min(count, h.target)) of \(h.target)").font(Theme.rounded(12)).foregroundStyle(Theme.dim) }
+                            }
                         }
                     }
                 }
-                if !o.priorities.isEmpty {
+                if !o.exercise.isEmpty {
+                    SectionLabel("Exercise")
+                    GlassCard {
+                        ForEach(o.exercise, id: \.key) { slot in
+                            let done = exerciseTicks[slot.key] ?? slot.done
+                            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                if canTick { checkbox(done) { tickExercise(slot, !done) } } else { Text("·").foregroundStyle(Theme.dim) }
+                                Text(slot.time).font(Theme.rounded(13, .regular)).foregroundStyle(Theme.dim).frame(width: 46, alignment: .leading)
+                                Text(slot.routine.name).font(Theme.rounded(15, .regular)).strikethrough(done, color: Theme.dim)
+                                    .foregroundStyle(done ? Theme.dim : Theme.text)
+                                Spacer()
+                                if slot.routine.minutes > 0 { Text("\(slot.routine.minutes) min").font(Theme.rounded(12)).foregroundStyle(Theme.dim) }
+                            }
+                        }
+                    }
+                }
+                if !o.priorityItems.isEmpty || canTick {
                     SectionLabel("Priorities")
-                    GlassCard { ForEach(o.priorities, id: \.self) { Text("· \($0)").font(Theme.rounded(14)) } }
+                    GlassCard {
+                        ForEach(Array(o.priorityItems.enumerated()), id: \.offset) { i, p in
+                            let done = priorityTicks[i] ?? p.done
+                            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                if canTick {
+                                    checkbox(done) { tickPriority(i, !done) }
+                                } else {
+                                    Text("·").foregroundStyle(Theme.dim)
+                                }
+                                Text(p.text).font(Theme.rounded(15, .regular)).strikethrough(done, color: Theme.dim)
+                                    .foregroundStyle(done ? Theme.dim : Theme.text)
+                            }
+                        }
+                        if canTick {
+                            HStack(spacing: 10) {
+                                Image(systemName: "plus").foregroundStyle(Theme.dim).frame(width: 20)
+                                TextField("", text: $newPriority, prompt: Text("Add a priority").foregroundStyle(Theme.faint))
+                                    .textFieldStyle(.plain).font(Theme.rounded(15, .regular))
+                                    .onSubmit(addPriority)
+                            }
+                        }
+                    }
+                }
+                if !o.wins.isEmpty || canTick {
+                    SectionLabel("Wins")
+                    GlassCard {
+                        if o.wins.isEmpty { Text("No wins yet.").foregroundStyle(Theme.dim) }
+                        ForEach(o.wins, id: \.id) { w in
+                            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                Image(systemName: "star.fill").font(.system(size: 11)).foregroundStyle(Theme.amber).frame(width: 20)
+                                Text(w.text).font(Theme.rounded(15, .regular))
+                            }
+                        }
+                        if canTick { addBox("Add a win", text: $newWin, onSubmit: addWin) }
+                    }
+                }
+                if let list = o.shoppingLists.first(where: { $0.entryID == chosenList }) ?? o.shoppingLists.first {
+                    shoppingHeader(o.shoppingLists, showing: list)
+                    GlassCard {
+                        if list.items.isEmpty { Text("Nothing on the list.").foregroundStyle(Theme.dim) }
+                        ForEach(list.items, id: \.id) { item in
+                            let got = shoppingTicks[item.id] ?? item.checked
+                            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                if canTick {
+                                    checkbox(got) { tickShopping(item.id, on: list.entryID, !got) }
+                                } else {
+                                    Text("·").foregroundStyle(Theme.dim)
+                                }
+                                Text(item.name).font(Theme.rounded(15, .regular)).strikethrough(got, color: Theme.dim)
+                                    .foregroundStyle(got ? Theme.dim : Theme.text)
+                            }
+                        }
+                        if canTick { addBox("Add an item", text: $newItem) { addItem(to: list.entryID) } }
+                    }
                 }
             } else {
-                Text("Import your Chronicles export to see your day here.").foregroundStyle(Theme.dim).padding(.top, 20)
+                Text("Connect to Chronicles, or import an export, to see your day here.").foregroundStyle(Theme.dim).padding(.top, 20)
+            }
+        }
+        // Fresh from Chronicles: what it says now wins over what was ticked here
+        .onChange(of: app.store.snapshot?.exportedAt) {
+            taskTicks = [:]; priorityTicks = [:]; shoppingTicks = [:]; doseTicks = [:]; habitCounts = [:]; exerciseTicks = [:]
+        }
+    }
+
+    private func checkbox(_ on: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: on ? "checkmark.circle.fill" : "circle")
+                .font(.system(size: 17)).foregroundStyle(on ? Theme.teal : Theme.dim).frame(width: 20)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(on ? "Done" : "Not done")
+    }
+
+    private func taskRow(_ t: PlanTask, _ o: DayOverview, canTick: Bool) -> some View {
+        let done = taskTicks[t.id] ?? (t.status == .done)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                if canTick {
+                    checkbox(done) { tickTask(t.id, !done) }
+                } else {
+                    Text("·").foregroundStyle(Theme.dim)
+                }
+                Text(t.title).font(Theme.rounded(15, .regular)).strikethrough(done, color: Theme.dim)
+                    .foregroundStyle(done ? Theme.dim : Theme.text)
+                Spacer()
+                if let time = t.scheduledTime { Text(time).font(Theme.rounded(12)).foregroundStyle(Theme.dim) }
+            }
+            if !done, let b = o.blockedBy[t.id], !b.isEmpty {
+                Text("Blocked by " + b.joined(separator: " · ")).font(Theme.rounded(12)).foregroundStyle(Theme.amber)
+                    .padding(.leading, 30)
             }
         }
     }
 
-    private func taskRow(_ t: PlanTask) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Image(systemName: t.status == .done ? "checkmark.circle.fill" : t.status == .inProgress ? "circle.lefthalf.filled" : "circle")
-                .foregroundStyle(t.status == .done ? Theme.teal : Theme.dim)
-            Text(t.title).font(Theme.rounded(15, .regular)).strikethrough(t.status == .done, color: Theme.dim)
-            Spacer()
-            if let time = t.scheduledTime { Text(time).font(Theme.rounded(12)).foregroundStyle(Theme.dim) }
+    private func tickTask(_ id: String, _ done: Bool) {
+        taskTicks[id] = done
+        Task { if !(await app.chronicles.setTask(id, done: done)) { taskTicks[id] = nil } }
+    }
+
+    private func addBox(_ prompt: String, text: Binding<String>, onSubmit: @escaping () -> Void) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "plus").foregroundStyle(Theme.dim).frame(width: 20)
+            TextField("", text: text, prompt: Text(prompt).foregroundStyle(Theme.faint))
+                .textFieldStyle(.plain).font(Theme.rounded(15, .regular))
+                .onSubmit(onSubmit)
         }
+    }
+
+    private func addWin() {
+        let text = newWin
+        guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        newWin = ""
+        Task { if !(await app.chronicles.addWin(text)) { newWin = text } }
+    }
+
+    private func addItem(to listID: String) {
+        let text = newItem
+        guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        newItem = ""
+        Task { if !(await app.chronicles.addShoppingItem(text, toList: listID)) { newItem = text } }
+    }
+
+    /// The list's name; with more than one active list, a menu of them all to switch between.
+    @ViewBuilder private func shoppingHeader(_ lists: [ShoppingList], showing list: ShoppingList) -> some View {
+        if lists.count > 1 {
+            Menu {
+                ForEach(lists, id: \.entryID) { l in
+                    Button {
+                        chosenList = l.entryID
+                    } label: {
+                        if l.entryID == list.entryID { Label(l.title, systemImage: "checkmark") } else { Text(l.title) }
+                    }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Caps(list.title, size: 11)
+                    Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold)).foregroundStyle(Theme.dim)
+                    Text("\(lists.count) lists").font(Theme.rounded(11)).foregroundStyle(Theme.faint)
+                }
+            }
+            .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+            .padding(.top, 34).padding(.bottom, 4)
+            .help("Switch shopping lists")
+        } else {
+            SectionLabel(list.title)
+        }
+    }
+
+    private func tickDose(_ d: DayOverview.Dose, key: String, _ taken: Bool) {
+        doseTicks[key] = taken
+        Task {
+            if !(await app.chronicles.setDose(medication: d.medication, medicationID: d.medicationID, time: d.time, taken: taken)) { doseTicks[key] = nil }
+        }
+    }
+
+    /// Not done yet: one more check-in. Done: one fewer (so a tick can be taken back).
+    private func tickHabit(_ h: DayOverview.HabitToday, count: Int) {
+        let add = count < h.target
+        habitCounts[h.id] = max(0, count + (add ? 1 : -1))
+        Task { if !(await app.chronicles.setHabit(h.id, add: add)) { habitCounts[h.id] = nil } }
+    }
+
+    private func tickExercise(_ slot: DayOverview.ExerciseSlot, _ done: Bool) {
+        exerciseTicks[slot.key] = done
+        Task { if !(await app.chronicles.setExercise(slot, done: done)) { exerciseTicks[slot.key] = nil } }
+    }
+
+    private func tickShopping(_ id: String, on listID: String, _ got: Bool) {
+        shoppingTicks[id] = got
+        Task { if !(await app.chronicles.setShoppingItem(id, onList: listID, got: got)) { shoppingTicks[id] = nil } }
+    }
+
+    private func tickPriority(_ index: Int, _ done: Bool) {
+        priorityTicks[index] = done
+        Task { if !(await app.chronicles.setPriority(at: index, done: done)) { priorityTicks[index] = nil } }
+    }
+
+    private func addPriority() {
+        let text = newPriority
+        guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        newPriority = ""
+        Task { if !(await app.chronicles.addPriority(text)) { newPriority = text } }
     }
 }
 
@@ -93,7 +289,9 @@ struct GoalsSheet: View {
             if let s = app.store.snapshot {
                 if let v = s.vision.overall {
                     SectionLabel("Vision")
-                    Text(v).font(Theme.rounded(20)).padding(.bottom, 4)
+                    Text(v).font(Theme.rounded(17)).lineSpacing(8)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.bottom, 24)
                 }
                 ForEach(s.goals.filter { $0.status != "completed" }) { g in
                     let tasks = s.tasks.filter { $0.goalID == g.id }
@@ -177,7 +375,7 @@ struct AboutYouView: View {
                 let facts = store.aboutYou.facts.filter { $0.category == c && (search.isEmpty || $0.text.localizedCaseInsensitiveContains(search)) }
                 if !facts.isEmpty {
                     SectionLabel(c.label)
-                    VStack(spacing: 14) { ForEach(facts) { f in factRow(f) } }
+                    VStack(spacing: 24) { ForEach(facts) { f in factRow(f) } }
                 }
             }
             if store.aboutYou.facts.isEmpty {
@@ -187,6 +385,7 @@ struct AboutYouView: View {
 
             SectionLabel("Conversations")
             if store.conversations.isEmpty { Text("No conversation summaries yet.").foregroundStyle(Theme.dim).font(Theme.rounded(13)) }
+            VStack(spacing: 24) {
             ForEach(store.conversations.reversed()) { c in
                 GlassCard {
                     HStack { Caps(Day.short(c.day), size: 8.5); Spacer()
@@ -195,6 +394,7 @@ struct AboutYouView: View {
                     }.font(Theme.rounded(12, .medium))
                     Text(c.text).font(Theme.rounded(14))
                 }
+            }
             }
 
             if !store.aboutYou.dontLearn.isEmpty {

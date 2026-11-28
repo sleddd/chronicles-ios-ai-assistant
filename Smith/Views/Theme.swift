@@ -96,14 +96,18 @@ struct GlassSheet<Content: View>: View {
     var body: some View {
         if let pageClose {
             VStack(alignment: .leading, spacing: 22) {
-                HStack {
-                    Text(title.uppercased()).font(Theme.rounded(13, .semibold)).tracking(2.4).foregroundStyle(Theme.text)
-                    Spacer()
-                    Button { pageClose() } label: {
-                        Image(systemName: "xmark").font(.system(size: 15, weight: .medium)).foregroundStyle(Theme.soft)
-                            .frame(width: 44, height: 44).overlay(Circle().stroke(.white.opacity(0.13)))
+                // No title row at all when the title is empty (the Today page: its tab says
+                // what it is, and changing tabs closes it), so the content starts at the top
+                if !title.isEmpty {
+                    HStack {
+                        Text(title.uppercased()).font(Theme.rounded(13, .semibold)).tracking(2.4).foregroundStyle(Theme.text)
+                        Spacer()
+                        Button { pageClose() } label: {
+                            Image(systemName: "xmark").font(.system(size: 15, weight: .medium)).foregroundStyle(Theme.soft)
+                                .frame(width: 44, height: 44).overlay(Circle().stroke(.white.opacity(0.13)))
+                        }
+                        .buttonStyle(.plain).help("Back to Home")
                     }
-                    .buttonStyle(.plain).help("Back to Today")
                 }
                 ScrollView { VStack(alignment: .leading, spacing: 16) { content }.padding(.bottom, 32).frame(maxWidth: .infinity, alignment: .leading) }
                     .scrollIndicators(.hidden)

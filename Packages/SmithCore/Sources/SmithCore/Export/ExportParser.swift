@@ -42,6 +42,8 @@ public enum ExportParser {
         if kept.features.contains("habits"), case .object(var o) = settings { o["habitLog"] = nil; settings = .object(o) }
         if kept.features.contains("vision"), case .object(var o) = settings { o["goalCategories"] = nil; settings = .object(o) }
         snap.displayName = settings["displayName"]?.string
+        let types = (settings["taskTypes"]?.array ?? []).compactMap(\.string).map { String($0.prefix(40)) }.filter { !$0.isEmpty }
+        snap.customTaskTypes = types.isEmpty ? nil : Array(types.prefix(50))
         snap.timeZone = settings["timezone"]?.string
 
         // Topics: id → name; an entry's kind comes from its topic's name.
@@ -52,6 +54,8 @@ public enum ExportParser {
         let habitLog = settings["habitLog"]?.object ?? [:]
         var journal: [TransientJournalEntry] = []
         var newestPriorities: (created: String, list: PriorityList)?
+        var newestWins: (created: String, list: WinsList)?
+        var openShopping: [(created: String, list: ShoppingList)] = []
 
         for e in root["entries"]?.array ?? [] {
             guard let id = idString(e["id"]) else { continue }
@@ -88,7 +92,8 @@ public enum ExportParser {
                     goalID: idString(cf["parentGoalId"]), milestoneID: idString(cf["parentMilestoneId"]),
                     openChecklistItems: cf["taskFormat"]?.string == "list"
                         ? (cf["checklist"]?.array ?? []).filter { $0["done"]?.bool != true }.count : 0,
-                    createdDay: createdDay))
+                    createdDay: createdDay, taskType: nonEmpty(cf["taskType"]),
+                    blockerList: { let b = TaskBlocker.list(from: cf["blockers"]); return b.isEmpty ? nil : b }()))
             case "goal":
                 var status = cf["goalStatus"]?.string ?? "new"
                 if status == "active" || status == "archived" { status = "new" }
@@ -119,6 +124,38 @@ public enum ExportParser {
                     targetPeriod: cf["targetPeriod"]?.string ?? "day",
                     days: (cf["days"]?.array ?? []).compactMap(\.int), isActive: cf["isActive"]?.bool != false,
                     goalID: idString(cf["parentGoalId"]), log: log))
+            case "routine":
+                guard cf["isActive"]?.bool != false else { continue }
+                let items = (cf["items"]?.array ?? []).filter { !(($0["name"]?.string ?? "").trimmingCharacters(in: .whitespaces).isEmpty) }
+                let typed = Double((cf["duration"]?.string ?? cf["duration"]?.double.map { String($0) } ?? "").trimmingCharacters(in: .whitespaces)) ?? 0
+                let summed = items.reduce(0.0) { $0 + amountMinutes($1["amount"]?.string ?? "") }
+                let times = (cf["scheduleTimes"]?.array ?? []).compactMap(\.string).filter { !$0.isEmpty }
+                let routine = Routine(id: id, name: nonEmpty(cf["routineName"]) ?? String(plainText(fromHTML: content).prefix(120)).ifEmpty("Exercise"),
+                                      exerciseType: nonEmpty(cf["exerciseType"]) ?? "yoga",
+                                      minutes: Int((typed > 0 ? typed : summed).rounded()),
+                                      itemIDs: items.compactMap { $0["id"]?.string },
+                                      days: (cf["days"]?.array ?? []).compactMap(\.int),
+                                      times: cf["scheduleTimes"]?.array == nil ? ["07:00"] : times,
+                                      trainingCategory: nonEmpty(cf["trainingCategory"]) ?? "")
+                snap.routines = (snap.routines ?? []) + [routine]
+            case "exercise":
+                // Only which routine slot a session was logged for (never its notes)
+                if let link = meta["_routineLink"]?.string, link.split(separator: "|").count == 3,
+                   let day = link.split(separator: "|").dropFirst().first.map(String.init), day >= Day.addDays(Day.key(for: now), -7) {
+                    var map = snap.routineSessions ?? [:]
+                    map[link] = id
+                    snap.routineSessions = map
+                }
+            case "media":
+                let rating = cf["rating"]?.double ?? Double(cf["rating"]?.string ?? "") ?? 0
+                let progress = cf["progress"]?.int ?? Int(cf["progress"]?.string ?? "") ?? 0
+                let item = MediaItem(id: id, title: name(cf["mediaTitle"], content), type: nonEmpty(cf["mediaType"]) ?? "book",
+                                     creator: nonEmpty(cf["creator"]) ?? "", album: nonEmpty(cf["album"]) ?? "",
+                                     season: nonEmpty(cf["season"]) ?? "", year: nonEmpty(cf["year"]) ?? cf["year"]?.int.map(String.init) ?? "",
+                                     genre: nonEmpty(cf["genre"]) ?? "", rating: max(0, min(5, rating)), shelf: cf["shelf"]?.string ?? "",
+                                     progress: max(0, min(100, progress)), notes: nonEmpty(cf["notes"]) ?? "",
+                                     tags: EntryTags.of(cf))
+                snap.media = (snap.media ?? []) + [item]
             case "allergy":
                 let a = name(cf["allergen"], content).trimmingCharacters(in: .whitespacesAndNewlines)
                 if !a.isEmpty { snap.allergyList = (snap.allergyList ?? []) + [a] }
@@ -131,21 +168,43 @@ public enum ExportParser {
             case "priorities":
                 let items = (cf["priorities"]?.array ?? []).compactMap { i -> PriorityList.Item? in
                     guard let t = i["text"]?.string, !t.isEmpty else { return nil }
-                    return .init(text: t, done: i["done"]?.bool ?? false)
+                    return .init(text: t, done: i["done"]?.bool ?? false, id: i["id"]?.string)
                 }
                 if created > (newestPriorities?.created ?? "") {
-                    newestPriorities = (created, PriorityList(day: createdDay ?? "", items: items))
+                    newestPriorities = (created, PriorityList(day: createdDay ?? "", items: items, entryID: id))
+                }
+            case "wins":
+                let items = (cf["wins"]?.array ?? []).compactMap { i -> WinsList.Item? in
+                    guard let id = i["id"]?.string, let t = i["text"]?.string, !t.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+                    return .init(id: id, text: t)
+                }
+                if created > (newestWins?.created ?? "") {
+                    newestWins = (created, WinsList(entryID: id, day: createdDay ?? "", items: items))
+                }
+            case "shopping_list":
+                let items = (cf["items"]?.array ?? []).compactMap { i -> ShoppingList.Item? in
+                    guard let id = i["id"]?.string, let n = i["name"]?.string, !n.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+                    return .init(id: id, name: n, category: i["category"]?.string ?? "other", checked: i["checked"]?.bool ?? false)
+                }
+                // Active, as Chronicles counts it: empty, or something still to get
+                if items.isEmpty || items.contains(where: { !$0.checked }) {
+                    let title = plainText(fromHTML: content).split(separator: "\n").first.map(String.init) ?? ""
+                    openShopping.append((created, ShoppingList(entryID: id, title: title.isEmpty ? "Shopping list" : String(title.prefix(80)), items: items)))
                 }
             case nil:
                 // A text entry: the journal, or a plain topic of the person's own. Private.
                 let text = plainText(fromHTML: content)
                 if content == "[Decryption failed]" { continue }
-                journal.append(TransientJournalEntry(id: id, day: createdDay ?? "", topicIDs: topicID.map { [$0] } ?? [], text: text))
+                journal.append(TransientJournalEntry(id: id, day: createdDay ?? "", topicIDs: topicID.map { [$0] } ?? [], text: text,
+                                                     tags: EntryTags.of(cf)))
             default:
                 continue // meals, symptoms, recipes, wins… not used
             }
         }
         snap.priorities = newestPriorities?.list
+        snap.wins = newestWins?.list
+        let lists = openShopping.sorted { $0.created > $1.created }.map(\.list)
+        snap.shoppingLists = lists.isEmpty ? nil : lists
 
         // Dose logs from the last 60 days.
         let cutoff = Day.addDays(Day.key(for: now), -60)
@@ -198,6 +257,18 @@ public enum ExportParser {
 
     // MARK: helpers
 
+    /// Chronicles' amountMinutes: "5 min" → 5, "90 sec" → 1.5, "1 hr" → 60; else 0.
+    static func amountMinutes(_ amount: String) -> Double {
+        let s = amount.trimmingCharacters(in: .whitespaces).lowercased()
+        guard let m = s.range(of: #"^(\d+(?:\.\d+)?)\s*(m|min|mins|minutes?|h|hr|hrs|hours?|s|sec|secs|seconds?)\b"#, options: .regularExpression) else { return 0 }
+        let part = String(s[m])
+        let num = Double(part.prefix { $0.isNumber || $0 == "." }) ?? 0
+        let unit = part.drop { $0.isNumber || $0 == "." || $0 == " " }
+        if unit.hasPrefix("h") { return num * 60 }
+        if unit.hasPrefix("s") { return num / 60 }
+        return num
+    }
+
     /// Chronicles' `topicKind`: the built-in kind a topic name holds, nil for a text topic.
     public static func kind(of topicName: String?) -> String? {
         guard let n = topicName?.trimmingCharacters(in: .whitespaces).lowercased(), !n.isEmpty else { return nil }
@@ -205,9 +276,9 @@ public enum ExportParser {
             "task": "task", "tasks": "task", "goal": "goal", "milestone": "milestone",
             "event": "event", "events": "event", "meeting": "meeting", "meetings": "meeting",
             "meals": "food", "medication": "medication", "symptom": "symptom", "exercise": "exercise",
-            "allergy": "allergy", "shopping list": "shopping_list", "recipe": "recipe", "recipes": "recipe",
+            "allergy": "allergy", "shopping list": "shopping_list", "shopping lists": "shopping_list", "recipe": "recipe", "recipes": "recipe",
             "priorities": "priorities", "wins": "wins", "wellness": "wellness", "menu plan": "menu_plan",
-            "change": "change", "changes": "change", "routine": "routine", "routines": "routine",
+            "change": "change", "changes": "change", "routine": "routine", "routines": "routine", "exercise routines": "routine", "exercise schedules": "routine",
             "exercise schedule": "routine", "exercise routine": "routine", "training plan": "training_plan",
             "training plans": "training_plan", "media": "media", "media journal": "media", "media library": "media",
             "habit": "habit", "habits": "habit",
@@ -264,4 +335,8 @@ public enum ExportParser {
         f.formatOptions = [.withInternetDateTime]
         return f.date(from: s)
     }
+}
+
+extension String {
+    func ifEmpty(_ other: String) -> String { trimmingCharacters(in: .whitespaces).isEmpty ? other : self }
 }

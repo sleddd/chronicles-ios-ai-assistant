@@ -19,8 +19,12 @@ final class FakeChronicles: ChroniclesTransport, @unchecked Sendable {
     var calls: [String] = []
     var created: [Int] = []
     var cursor = 1
-    /// "rekey": every request answers 409 (moving to a new key); "limit": creating answers 429
+    /// "rekey": every request answers 409 (moving to a new key); "limit": creating answers 429;
+    /// "oldDelete": deletes as Chronicles did before the AI app could delete (403)
     var mode: String?
+    /// Copies kept of entries the AI app deleted: change id → (entry id, row)
+    var keptDeletes: [Int: (Int, JSONValue)] = [:]
+    var nextChange = 500
 
     init() throws {
         let url = Bundle.module.url(forResource: "chronicles-vectors", withExtension: "json", subdirectory: "Fixtures")!
@@ -96,7 +100,7 @@ final class FakeChronicles: ChroniclesTransport, @unchecked Sendable {
             entries[id] = .object(row); created.append(id)
             return HTTPResponse(status: 201, body: .object(row))
         case ("GET", "/api/topics"):
-            let names = [1: "Task", 2: "Journal", 3: "Meals", 4: "Medication", 5: "Habits", 6: "Therapy notes", 7: "Idea"]
+            let names = [1: "Task", 2: "Journal", 3: "Meals", 4: "Medication", 5: "Habits", 6: "Therapy notes", 7: "Idea", 8: "Events", 9: "Priorities", 11: "Wins", 12: "Shopping list", 13: "Exercise Routine", 14: "Exercise", 15: "Media"]
             return HTTPResponse(status: 200, body: .array(try names.sorted { $0.key < $1.key }.map { id, name in
                 let s = try ChroniclesCrypto.sealRecord(kind: "topic", id: String(id), record: ["name": .string(name), "icon": .null], key: mk)
                 return ["id": .number(Double(id)), "payload": .string(s.payload), "iv": .string(s.iv), "color": .null]
@@ -125,11 +129,20 @@ final class FakeChronicles: ChroniclesTransport, @unchecked Sendable {
                 entries[id] = .object(row)
                 return HTTPResponse(status: 200, body: .object(row))
             case "DELETE":
-                guard created.contains(id) else { return HTTPResponse(status: 403, body: ["error": "Can only undo what it just created"]) }
+                if created.contains(id) { entries[id] = nil; return HTTPResponse(status: 200, body: ["success": true]) }
+                guard mode != "oldDelete", let row = entries[id] else { return HTTPResponse(status: 403, body: ["error": "Can only undo what it just created"]) }
+                nextChange += 1
+                keptDeletes[nextChange] = (id, row)
                 entries[id] = nil
-                return HTTPResponse(status: 200, body: ["success": true])
+                return HTTPResponse(status: 200, body: ["keptChangeId": .number(Double(nextChange))])
             default: break
             }
+        }
+        if method == "POST", p.hasPrefix("/api/assistant-changes/"), p.hasSuffix("/restore"),
+           let cid = Int(p.dropFirst("/api/assistant-changes/".count).dropLast("/restore".count)) {
+            guard let (id, row) = keptDeletes.removeValue(forKey: cid), entries[id] == nil else { return HTTPResponse(status: 403, body: ["error": "Not yours to put back"]) }
+            entries[id] = row
+            return HTTPResponse(status: 200, body: ["ok": true])
         }
         if method == "PUT", p.hasPrefix("/api/doses/") {
             let uuid = String(p.dropFirst("/api/doses/".count))

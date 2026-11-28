@@ -19,7 +19,7 @@ public struct FindTasksTool: LocalTool {
     public init(snapshot: @escaping @Sendable () -> ChroniclesSnapshot?) { self.snapshot = snapshot }
     public var name: String { "find_tasks" }
     public var description: String {
-        "Search tasks by words in the title and/or a date range (scheduled or deadline). Returns up to 25 tasks."
+        "Search tasks by words in the title and/or a date range (scheduled or deadline). Returns up to 25 tasks with their ids, types and what's blocking them, and the task types they use."
     }
     public var inputSchema: JSONValue {
         ["type": "object", "properties": [
@@ -27,6 +27,7 @@ public struct FindTasksTool: LocalTool {
             "from": ["type": "string", "description": "First day, YYYY-MM-DD. Optional."],
             "to": ["type": "string", "description": "Last day, YYYY-MM-DD. Optional."],
             "include_done": ["type": "boolean", "description": "Include completed tasks. Default false."],
+            "blocked_only": ["type": "boolean", "description": "Only tasks something is blocking. Default false."],
         ], "additionalProperties": false]
     }
     public func run(_ input: JSONValue) async throws -> String {
@@ -34,8 +35,10 @@ public struct FindTasksTool: LocalTool {
         let q = input["query"]?.string?.lowercased().split(separator: " ").map(String.init) ?? []
         let from = input["from"]?.string, to = input["to"]?.string
         let done = input["include_done"]?.bool ?? false
+        let blockedOnly = input["blocked_only"]?.bool ?? false
         let hits = s.tasks.filter { t in
             if !done && !t.isOpen { return false }
+            if blockedOnly && t.openBlockers(in: s.tasks).isEmpty { return false }
             if !q.isEmpty && !q.allSatisfy({ t.title.lowercased().contains($0) }) { return false }
             if from != nil || to != nil {
                 let days = [t.scheduledDate, t.deadline].compactMap { $0 }
@@ -43,7 +46,8 @@ public struct FindTasksTool: LocalTool {
             }
             return true
         }.sorted { ($0.scheduledDate ?? $0.deadline ?? "9999") < ($1.scheduledDate ?? $1.deadline ?? "9999") }
-        guard !hits.isEmpty else { return "No matching tasks." }
+        let types = "Task types: " + s.taskTypes.joined(separator: ", ") + "."
+        guard !hits.isEmpty else { return "No matching tasks.\n\(types)" }
         let goals = Dictionary(s.goals.map { ($0.id, $0.title) }, uniquingKeysWith: { a, _ in a })
         return hits.prefix(25).map { t in
             var bits = [t.status.rawValue]
@@ -51,8 +55,12 @@ public struct FindTasksTool: LocalTool {
             if let d = t.deadline { bits.append("deadline \(d)") }
             if t.priority != "none" { bits.append("\(t.priority) priority") }
             if let g = t.goalID.flatMap({ goals[$0] }) { bits.append("goal: \(g)") }
+            if let ty = t.taskType { bits.append("type: \(ty)") }
+            let blocked = t.blockerWords(in: s.tasks)
+            if !blocked.isEmpty { bits.append("blocked by: \(blocked.joined(separator: "; "))") }
+            bits.append("id \(t.id)")
             return "- \(t.title) (\(bits.joined(separator: ", ")))"
-        }.joined(separator: "\n")
+        }.joined(separator: "\n") + "\n" + types
     }
 }
 
@@ -167,5 +175,53 @@ public struct MemoryTool: LocalTool {
         case "note": return await handle(.note(fact, cat))
         default: return await handle(.remember(fact, cat))
         }
+    }
+}
+
+/// Their Media journal: books, movies, TV shows and music, with their notes.
+public struct FindMediaTool: LocalTool {
+    let snapshot: @Sendable () -> ChroniclesSnapshot?
+    public init(snapshot: @escaping @Sendable () -> ChroniclesSnapshot?) { self.snapshot = snapshot }
+    public var name: String { "find_media" }
+    public var description: String {
+        "Their Media journal in Chronicles: books, movies, TV shows and music, with shelf (reading / want to / done / paused / didn't finish), rating, progress, genre, tags and their notes. Filter by words, type, shelf or rating. Returns up to 30."
+    }
+    public var inputSchema: JSONValue {
+        ["type": "object", "properties": [
+            "query": ["type": "string", "description": "Words in the title, creator, genre, tags or notes. Optional."],
+            "type": ["type": "string", "enum": ["book", "movie", "tv", "music"]],
+            "shelf": ["type": "string", "enum": ["current", "want", "done", "paused", "dnf"]],
+            "min_rating": ["type": "number", "minimum": 0, "maximum": 5],
+        ], "additionalProperties": false]
+    }
+    public func run(_ input: JSONValue) async throws -> String {
+        guard let s = snapshot() else { return "No Chronicles data imported yet." }
+        let all = s.media ?? []
+        guard !all.isEmpty else { return "Nothing in their Media journal (or it's kept from AI in Chronicles)." }
+        let words = input["query"]?.string?.lowercased().split(whereSeparator: \.isWhitespace).map(String.init) ?? []
+        let hits = all.filter { m in
+            if let t = input["type"]?.string, m.type != t { return false }
+            if let sh = input["shelf"]?.string, m.shelf != sh { return false }
+            if let r = input["min_rating"]?.double, m.rating < r { return false }
+            let hay = ([m.title, m.creator, m.album, m.genre, m.notes] + m.tags).joined(separator: " ").lowercased()
+            return words.allSatisfy { hay.contains($0) }
+        }
+        guard !hits.isEmpty else { return "Nothing in their Media journal matches." }
+        let label = ["book": "Book", "movie": "Movie", "tv": "TV show", "music": "Music"]
+        return "\(hits.count) found\(hits.count > 30 ? " (first 30)" : ""):\n" + hits.prefix(30).map { m in
+            var bits = [label[m.type] ?? m.type]
+            if !m.creator.isEmpty { bits.append("by \(m.creator)") }
+            if !m.album.isEmpty { bits.append("on \(m.album)") }
+            if !m.season.isEmpty { bits.append(m.season) }
+            if !m.year.isEmpty { bits.append(m.year) }
+            if !m.genre.isEmpty { bits.append(m.genre) }
+            bits.append(m.shelfLabel)
+            if m.shelf == "current", m.progress > 0 { bits.append("\(m.progress)% through") }
+            if m.rating > 0 { bits.append("rated \(m.rating.formatted()) of 5") }
+            if !m.tags.isEmpty { bits.append("tags: \(m.tags.joined(separator: ", "))") }
+            var line = "- \(m.title) (\(bits.joined(separator: ", ")))"
+            if !m.notes.isEmpty { line += "\n  Notes: " + String(m.notes.prefix(1500)) }
+            return line
+        }.joined(separator: "\n")
     }
 }

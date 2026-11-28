@@ -159,7 +159,7 @@ final class SafetyCenter {
     // MARK: screening
 
     private func classifier(_ system: String, _ prompt: String, schema: JSONValue) async throws -> String {
-        let runner = ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }), tools: [])
+        let runner = ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }, fallbackKey: { APIKeys.fallback() }), tools: [])
         let req = ClaudeRequest(model: AppModel.shared.store.settings.model, maxTokens: 2000, effort: "low",
                                 system: [SystemBlock(system)], messages: [["role": "user", "content": .string(prompt)]],
                                 jsonSchema: schema)

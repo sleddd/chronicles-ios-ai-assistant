@@ -256,4 +256,9 @@ nonisolated enum APIKeys {
         if let k = lock.withLock({ preferChronicles ? chronicles : nil }) { return k }
         return Keychain.apiKey
     }
+
+    /// The key saved in Smith, when `current()` is Chronicles' key: tried if that one is turned down.
+    static func fallback() -> String? {
+        lock.withLock({ preferChronicles && chronicles != nil }) ? Keychain.apiKey : nil
+    }
 }

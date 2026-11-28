@@ -16,6 +16,8 @@ public enum UndoAction: Sendable, Equatable {
     /// leaving whatever else was changed on it since.
     case restoreFields(id: Int, fields: [String: JSONValue?])
     case removeBillPayment(billID: String, paymentID: String)
+    /// Puts back an entry the AI app deleted, from the copy Chronicles kept (same id).
+    case restoreDeleted(changeID: Int)
     /// Several at once (a dose and the Meals row it added), undone last first.
     indirect case all([UndoAction])
 }
@@ -141,6 +143,73 @@ public struct ChroniclesWriter: Sendable {
             meta["_taxonomyId"] = .number(Double(topicID))
             meta["_customFields"] = e.metadata["_customFields"]
         }
+    }
+
+    /// A task ticked done, in progress or back to to-do (Chronicles' taskFieldsForStatus).
+    public func setTaskStatus(id: Int, status: String) async throws {
+        _ = try await updateEntry(id: id) { _, meta in ChroniclesShapes.setTaskStatus(&meta, to: status) }
+    }
+
+    /// The priorities list read fresh, changed, saved. `change` returns nil to leave it as it is.
+    public func updatePriorities(entryID: Int, _ change: @Sendable ([PriorityList.Item]) -> [PriorityList.Item]?) async throws {
+        _ = try await updateEntry(id: entryID) { _, meta in
+            var cf = meta["_customFields"]?.object ?? [:]
+            let items = (cf["priorities"]?.array ?? []).compactMap { i -> PriorityList.Item? in
+                guard let t = i["text"]?.string, !t.isEmpty else { return nil }
+                return .init(text: t, done: i["done"]?.bool ?? false, id: i["id"]?.string)
+            }
+            guard let list = change(items) else { return }
+            cf["priorities"] = ChroniclesShapes.priorities(list)
+            meta["_customFields"] = .object(cf)
+        }
+    }
+
+    /// The Wins list read fresh, changed, saved: its items and, as Chronicles keeps
+    /// it, its text ("Wins: 11/25/2026" over the wins as a list).
+    public func updateWins(entryID: Int, _ change: @Sendable ([WinsList.Item]) -> [WinsList.Item]?) async throws {
+        _ = try await updateEntry(id: entryID) { content, meta in
+            var cf = meta["_customFields"]?.object ?? [:]
+            let items = (cf["wins"]?.array ?? []).compactMap { i -> WinsList.Item? in
+                guard let id = i["id"]?.string, let t = i["text"]?.string else { return nil }
+                return .init(id: id, text: t)
+            }
+            guard let list = change(items) else { return }
+            cf["wins"] = ChroniclesShapes.wins(list)
+            meta["_customFields"] = .object(cf)
+            let title = content.range(of: #"Wins: \d{2}/\d{2}/\d{4}"#, options: .regularExpression).map { String(content[$0]) } ?? "Wins"
+            content = ChroniclesShapes.winsContent(title: title, list)
+        }
+    }
+
+    /// The shopping list read fresh, changed, saved (its notes and recipes stay as they are).
+    public func updateShopping(entryID: Int, _ change: @Sendable ([ShoppingList.Item]) -> [ShoppingList.Item]?) async throws {
+        _ = try await updateEntry(id: entryID) { _, meta in
+            var cf = meta["_customFields"]?.object ?? [:]
+            let raw = cf["items"]?.array ?? []
+            let items = raw.compactMap { i -> ShoppingList.Item? in
+                guard let id = i["id"]?.string, let n = i["name"]?.string else { return nil }
+                return .init(id: id, name: n, category: i["category"]?.string ?? "other", checked: i["checked"]?.bool ?? false)
+            }
+            guard let list = change(items) else { return }
+            cf["items"] = .array(list.map { ["id": .string($0.id), "name": .string($0.name), "category": .string($0.category), "checked": .bool($0.checked)] })
+            meta["_customFields"] = .object(cf)
+        }
+    }
+
+    /// A routine session ticked done: an Exercise entry for that slot, as Chronicles
+    /// logs it (linked by `_routineLink`). Returns the new entry's id.
+    public func logRoutineSession(_ r: Routine, day: String, time: String, exerciseTopicID: Int, now: Date = Date()) async throws -> Int {
+        let key = r.linkKey(day: day, time: time)
+        let meta: JSONValue = ["_taxonomyId": .number(Double(exerciseTopicID)), "_routineLink": .string(key),
+                               "_customFields": .object(r.sessionFields(day: day, time: time))]
+        return try await createEntry(content: ChroniclesShapes.html(r.sessionTitle), metadata: meta, now: now)
+    }
+
+    /// Deletes one of their entries. Chronicles keeps a copy they can put back for two
+    /// weeks, and for two minutes the AI app can put it back itself (Undo). Returns
+    /// that copy's id, nil if Chronicles didn't say (then there's nothing to undo with).
+    public func deleteEntry(id: Int) async throws -> Int? {
+        try await client.call("DELETE", "/api/entries/\(id)", nil, session).body["keptChangeId"]?.int
     }
 
     public func deleteSmithRecord(entryID: Int) async throws {
@@ -324,6 +393,8 @@ public struct ChroniclesWriter: Sendable {
             guard var bill = try await billRecord(billID) else { return }
             bill["payments"] = .array((bill["payments"]?.array ?? []).filter { $0["id"]?.string != paymentID })
             try await putBill(billID, .object(bill))
+        case .restoreDeleted(let changeID):
+            try await client.call("POST", "/api/assistant-changes/\(changeID)/restore", [:], session)
         }
     }
 }
@@ -388,6 +459,85 @@ public enum ChroniclesShapes {
         if let date { cf["scheduledDate"] = .string(date) }
         if let time { cf["scheduledTime"] = .string(time) }
         return (html(t), ["_taxonomyId": .number(Double(topicID)), "_customFields": .object(cf)])
+    }
+
+    /// A task's details changed the way Chronicles' task editor changes them. Only the
+    /// keys given are touched; "" clears a field (Chronicles stores "" for none).
+    /// Returns the custom-field keys it changed, for undo.
+    @discardableResult
+    public static func editTask(_ content: inout String, _ meta: inout [String: JSONValue], _ set: [String: JSONValue]) -> Set<String> {
+        var cf = meta["_customFields"]?.object ?? [:]
+        var touched = Set<String>()
+        func put(_ k: String, _ v: JSONValue) { cf[k] = v; touched.insert(k) }
+        for (k, v) in set { put(k, v) }
+        // A new title: the task's name, and its text too when the text was only the old name
+        if let title = set["taskDescription"]?.string {
+            let old = ExportParser.plainText(fromHTML: content)
+            let was = meta["_customFields"]?["taskDescription"]?.string ?? ""
+            if old.isEmpty || old == was { content = html(title) }
+        }
+        // Chronicles' editor rules: no date, no time; a time with no date takes the deadline's
+        // day or today's; neither date nor deadline, no part of the day
+        let date = cf["scheduledDate"]?.string ?? "", deadline = cf["deadline"]?.string ?? ""
+        if set["scheduledDate"] != nil, date.isEmpty, !(cf["scheduledTime"]?.string ?? "").isEmpty { put("scheduledTime", "") }
+        if date.isEmpty, deadline.isEmpty, (set["scheduledDate"] != nil || set["deadline"] != nil),
+           !(cf["scheduledPart"]?.string ?? "").isEmpty || !(cf["scheduledPartEnd"]?.string ?? "").isEmpty {
+            put("scheduledPart", ""); put("scheduledPartEnd", "")
+        }
+        meta["_customFields"] = .object(cf)
+        return touched
+    }
+
+    /// An event or meeting changed: only the keys given. Returns the keys changed.
+    @discardableResult
+    public static func editEvent(_ content: inout String, _ meta: inout [String: JSONValue], isMeeting: Bool, _ set: [String: JSONValue]) -> Set<String> {
+        var cf = meta["_customFields"]?.object ?? [:]
+        let nameKey = isMeeting ? "meetingName" : (cf["eventName"] != nil || cf["calendarTitle"] == nil ? "eventName" : "calendarTitle")
+        var touched = Set<String>()
+        for (k, v) in set {
+            let key = k == "title" ? nameKey : k
+            cf[key] = v; touched.insert(key)
+        }
+        if let title = set["title"]?.string {
+            let old = ExportParser.plainText(fromHTML: content)
+            let was = meta["_customFields"]?[nameKey]?.string ?? ""
+            if old.isEmpty || old == was { content = html(title) }
+        }
+        // An end before a new start would make an event that ends before it begins: it ends that day
+        if let start = cf["startDate"]?.string, let end = cf["endDate"]?.string, !end.isEmpty, end < start, set["startDate"] != nil {
+            cf["endDate"] = .string(start); touched.insert("endDate")
+        }
+        meta["_customFields"] = .object(cf)
+        return touched
+    }
+
+    /// The Priorities list entry's fields (Chronicles' usePriorityList).
+    public static func priorities(_ items: [PriorityList.Item]) -> JSONValue {
+        .array(items.map { ["id": .string($0.id ?? UUID().uuidString.lowercased()), "text": .string($0.text), "done": .bool($0.done)] })
+    }
+
+    public static func wins(_ items: [WinsList.Item]) -> JSONValue {
+        .array(items.map { ["id": .string($0.id), "text": .string($0.text)] })
+    }
+
+    /// Chronicles' winsContent: the title, then each win as a list item.
+    public static func winsContent(title: String, _ items: [WinsList.Item]) -> String {
+        let texts = items.map { $0.text.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        let list = texts.isEmpty ? "" : "<ul>" + texts.map { "<li><p>\(escape($0))</p></li>" }.joined() + "</ul>"
+        return "<p>\(escape(title))</p>" + list
+    }
+
+    /// A new Wins entry for today ("Wins: 11/25/2026").
+    public static func newWins(_ items: [WinsList.Item], day: String, topicID: Int) -> (content: String, metadata: JSONValue) {
+        let title = Day.parse(day).map { String(format: "Wins: %02d/%02d/%04d", $0.1, $0.2, $0.0) } ?? "Wins"
+        return (winsContent(title: title, items), ["_taxonomyId": .number(Double(topicID)), "_customFields": ["wins": wins(items)]])
+    }
+
+    /// A new Priorities entry, titled with today's date the way Chronicles titles it ("Priorities: 11/25/2026").
+    public static func newPriorities(_ items: [PriorityList.Item], day: String, topicID: Int) -> (content: String, metadata: JSONValue) {
+        let p = Day.parse(day)
+        let title = p.map { String(format: "Priorities: %02d/%02d/%04d", $0.1, $0.2, $0.0) } ?? "Priorities"
+        return (html(title), ["_taxonomyId": .number(Double(topicID)), "_customFields": ["priorities": priorities(items)]])
     }
 
     /// Chronicles' taskFieldsForStatus: done / in progress / to do.

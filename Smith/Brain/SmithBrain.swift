@@ -116,6 +116,7 @@ final class SmithBrain {
         return [
             TodayOverviewTool { ctx }, FindTasksTool { snap }, GoalsProgressTool { snap }, BillsDueTool { ctx },
             JournalSummaryTool { digest }, CurrentTimeTool(),
+            FindTagsTool { await MainActor.run { store.taggedEntries } }, FindMediaTool { snap },
             WeatherTool { try await weather.fetchLine() },
             MemoryTool { [weak self] action in await MainActor.run { self?.memory(action) ?? "Not saved." } },
         ] + (actions && chronicles.isUnlocked ? ChroniclesActionTools.all(chronicles.actionContext(estimate: nutrientEstimator())) : [])
@@ -125,7 +126,7 @@ final class SmithBrain {
     private func nutrientEstimator() -> @Sendable (String, String?, String?) async -> [String: Double]? {
         let model = store.settings.model
         return { item, mealType, ingredients in
-            let r = ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }), tools: [])
+            let r = ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }, fallbackKey: { APIKeys.fallback() }), tools: [])
             let req = ClaudeRequest(model: model, maxTokens: 1000, effort: "low",
                                     system: [SystemBlock(ChroniclesShapes.nutritionSystem)],
                                     messages: [["role": "user", "content": .string(ChroniclesShapes.nutritionPrompt(item: item, mealType: mealType, ingredients: ingredients))]])
@@ -135,7 +136,7 @@ final class SmithBrain {
     }
 
     private var runner: ChatRunner {
-        ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }), tools: tools(),
+        ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }, fallbackKey: { APIKeys.fallback() }), tools: tools(),
                    phraseGuard: PhraseGuard(phrases: store.settings.bannedPhrases))
     }
 
@@ -296,6 +297,10 @@ final class SmithBrain {
         let speak = spoken || (store.settings.speakTypedReplies && !store.settings.muted)
         isThinking = true
         lastError = nil
+        // A new answer: the last answer's "will remember" and Undo pills go, so the
+        // screen shows only what this one does (notes stay saved; Me lists them)
+        noted = []
+        chronicles.clearUndoChips()
         defer { isThinking = false; workingOn = nil; scheduleCheckpoint() }
         let ctx = context()
         let runner = self.runner
@@ -522,9 +527,10 @@ final class SmithBrain {
             return "I'm worried about you. Please call or text 988 to talk with someone right now, or call 911 if you're in danger. Open Smith and we can keep talking."
         }
         let ctx = context()
-        // Asked through Siri, perhaps not by them: it can look things up, not write or remember
-        let runner = ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }),
-                                tools: tools(actions: false).filter { !$0.changesData },
+        // Asked through Siri, perhaps not by them: it can look things up, not write or remember,
+        // and not list the tags on their journal entries or read out their media notes
+        let runner = ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }, fallbackKey: { APIKeys.fallback() }),
+                                tools: tools(actions: false).filter { !$0.changesData && $0.name != "find_tags" && $0.name != "find_media" },
                                 phraseGuard: PhraseGuard(phrases: store.settings.bannedPhrases))
         let req = ClaudeRequest(model: store.settings.model, effort: "low", system: ctx.systemBlocks(spoken: true),
                                 messages: [["role": "user", "content": .string(question)]],
@@ -583,7 +589,7 @@ final class SmithBrain {
         let transcript = transcript.filter { $0["role"]?.string != "system" }
         var result = await OnDeviceWrapUp.run(transcript: WrapUp.transcript(transcript, name: store.settings.name))
         if result == nil {
-            let r = ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }), tools: [])
+            let r = ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }, fallbackKey: { APIKeys.fallback() }), tools: [])
             if let text = try? await r.complete(WrapUp.request(for: transcript, model: store.settings.model)) {
                 result = WrapUp.parse(text)
             }
@@ -788,7 +794,7 @@ enum HenryWriter {
             }
         }
         let (system, ask, review) = request(store: store, message: message, risk: risk)
-        let runner = ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }), tools: [])
+        let runner = ChatRunner(transport: URLSessionTransport(apiKey: { APIKeys.current() }, fallbackKey: { APIKeys.fallback() }), tools: [])
         func draft(_ extra: String) async throws -> String {
             let req = ClaudeRequest(model: store.settings.model, maxTokens: 4000, effort: "medium", system: system,
                                     messages: [["role": "user", "content": .string(ask + extra)]])
